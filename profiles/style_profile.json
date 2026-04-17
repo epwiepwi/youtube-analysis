@@ -1,0 +1,102 @@
+{
+  "meta": {
+    "analyzed_videos": ["양파 망째.mp4"],
+    "total_duration_sec": 28,
+    "genre": "정보 전달형 짜집기 릴스/쇼츠",
+    "target_audience": "주부, 자취생, 살림 꿀팁에 관심 많은 프로 살림꾼들",
+    "overall_vibe": "빠른 템포, 경각심 유발, 호기심 자극, 텐션업"
+  },
+  "pacing": {
+    "avg_cut_length_sec": 1.47,
+    "shortest_cut_sec": 1.0,
+    "longest_cut_sec": 3.0,
+    "total_cuts": 19,
+    "cuts_per_10sec": 6.7,
+    "beat_sync": "나레이션 호흡(어절)에 맞춘 칼각 컷 전환",
+    "rhythm_pattern": "초반(경고/문제제기)은 1초 단위로 빠르게 -> 중후반(해결책/결과)은 2~3초로 여유 있게"
+  },
+  "hook": {
+    "opening_duration_sec": 2.0,
+    "opening_technique": "시각적 충격 + 타겟 저격 질문형 텍스트",
+    "opening_text_example": "혹시 양파 그냥 망째로 보관하시면",
+    "retention_tactics": [
+      "치명적인 문제 언급으로 공포 소구",
+      "해결 방법은 끝까지 안 보여주며 떡밥 투척",
+      "댓글 유도(CTA)로 알고리즘 부스팅"
+    ]
+  },
+  "captions": {
+    "presence_rate": 100,
+    "font_style": "온글잎 의연체",
+    "font_size_relative": 12,
+    "primary_color": "#FFFFFF",
+    "stroke_color": "#000000",
+    "stroke_width": 4,
+    "background": "없음",
+    "position": "center",
+    "position_y_ratio": 0.5,
+    "animation_in": "단어 단위 팝업",
+    "highlight_style": "이모지 활용 (❌, 💦 등)",
+    "avg_chars_per_caption": 6,
+    "max_words_per_caption": 2,
+    "timing": "대사와 0.1초 선행",
+    "examples": [
+      {"timestamp": "0:00", "text": "혹시 양파 그냥"},
+      {"timestamp": "0:01", "text": "망째로 보관하시면 ❌"},
+      {"timestamp": "0:02", "text": "꼭 보세요"},
+      {"timestamp": "0:04", "text": "던져놨었는데요"},
+      {"timestamp": "0:09", "text": "90%가 다 물이라"},
+      {"timestamp": "0:11", "text": "금방 새카만 곰팡이가"},
+      {"timestamp": "0:13", "text": "이게 1급 발암물질이라"},
+      {"timestamp": "0:20", "text": "솔직히 별 기대"},
+      {"timestamp": "0:21", "text": "진짜 신세계더라고요"},
+      {"timestamp": "0:25", "text": "너~~무 좋아요"},
+      {"timestamp": "0:26", "text": "\"양파\"라고"},
+      {"timestamp": "0:28", "text": "바로 알려드릴게요"}
+    ]
+  },
+  "visual_effects": {
+    "zoom": {"usage_rate": "낮음", "type": "원본 소스 움직임 그대로"},
+    "shake": "없음",
+    "speed_ramp": "없음",
+    "freeze_frame": "없음",
+    "transitions": [{"type": "점프컷", "frequency": "100%"}],
+    "overlays": "시스템 이모지만"
+  },
+  "audio": {
+    "bgm": {"genre": "없음", "use": false},
+    "sfx": {"usage_frequency": "0", "types": []},
+    "voice": "또렷하고 친근한 여성 나레이션"
+  },
+  "color": {
+    "look": "밝은 톤업 필터 (소스 이질감 완화)",
+    "saturation": "중간",
+    "contrast": "중간"
+  },
+  "content_structure": {
+    "template": "충격적 훅(문제) -> 원인 설명(공감/권위) -> 해결책의 효과 과시 -> 정보 제한 + 댓글 CTA",
+    "avg_clips_per_video": 18,
+    "clip_source": "해외 영상, 무료 스톡 푸티지 짜집기",
+    "narrative_device": "문제-해결형 + 정보 제한(Information Gap)"
+  },
+  "ending": {
+    "cta_type": "특정 단어 댓글 유도 (자동 DM 발송 연계)",
+    "duration_sec": 3.0,
+    "text_example": "\"양파\"라고 댓글 남겨주시면 바로 알려드릴게요"
+  },
+  "capcut_automation_hints": {
+    "frequently_used_features": [
+      "자동 자막 생성",
+      "자막 일괄 수정/스타일링",
+      "오디오 분할(점프컷)"
+    ],
+    "critical_steps_order": [
+      "1. 나레이션 오디오 트랙 먼저 깔기",
+      "2. 오디오 내용과 싱크가 맞는 짜집기 소스 영상 수집 및 배치",
+      "3. 오디오 파형에 맞춰 화면 하드컷(점프컷)",
+      "4. 자동 자막 생성 후 1~2어절 단위로 나누기",
+      "5. 자막 정중앙 배치 및 온글잎 의연체 폰트 적용"
+    ],
+    "style_signature": "BGM 없이 오직 나레이션 템포와 정중앙 단문 자막(의연체)만으로 여러 스톡 영상을 위화감 없이 끌고 가는 흡입력"
+  }
+}
