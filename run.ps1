@@ -4,6 +4,7 @@ param(
     [string]$Name = "shorts_001",
     [string]$Model = "small",
     [string]$Device = "cpu",
+    [string]$Reference = "",
     [switch]$Semantic
 )
 
@@ -25,5 +26,6 @@ Write-Host ""
 
 $extra = @()
 if ($Semantic) { $extra += "--semantic" }
+if ($Reference) { $extra += "--reference"; $extra += "$Reference" }
 
 python -m src.main --narration "$Narration" --clips "$Clips" --name "$Name" @extra

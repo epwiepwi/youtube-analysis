@@ -22,6 +22,7 @@ def run(
     draft_root: Path,
     output_dir: Path,
     use_semantic: bool = False,
+    reference_video: Path | None = None,
 ) -> Path:
     style = load_style(profile_path)
 
@@ -31,8 +32,11 @@ def run(
     print(f"  -> {len(transcript.words)} words, {transcript.duration:.2f}s")
 
     print("[2/4] Building edit plan...")
-    plan = build_plan(narration, transcript, clips_dir, style,
-                     use_semantic=use_semantic, output_dir=output_dir)
+    plan = build_plan(
+        narration, transcript, clips_dir, style,
+        use_semantic=use_semantic, output_dir=output_dir,
+        reference_video=reference_video,
+    )
     save_plan(plan, output_dir / "plan.json")
     print(f"  -> {len(plan.video_segments)} cuts, {len(plan.captions)} captions")
 
@@ -58,6 +62,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=PATHS.output_root)
     parser.add_argument("--semantic", action="store_true",
                         help="Use Gemini to analyze clips and match them to captions semantically")
+    parser.add_argument("--reference", type=Path, default=None,
+                        help="Path to a successful reference short (.mp4) to imitate beat-by-beat")
     args = parser.parse_args()
 
     args.output.mkdir(parents=True, exist_ok=True)
@@ -69,6 +75,7 @@ def main() -> None:
         draft_root=args.draft_root,
         output_dir=args.output,
         use_semantic=args.semantic,
+        reference_video=args.reference,
     )
 
 

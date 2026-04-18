@@ -303,11 +303,52 @@ def build_plan(
     style: dict,
     use_semantic: bool = False,
     output_dir: Path | None = None,
+    reference_video: Path | None = None,
 ) -> EditPlan:
     clips = load_clips(clip_dir)
     cut_points = compute_cut_points(transcript, style)
     if cut_points[-1] < transcript.duration:
         cut_points.append(transcript.duration)
+
+    reference_template = None
+    reference_beats_per_cut: list = []
+    if reference_video:
+        from .reference import align_to_user_timeline, analyze_reference
+        cache = (output_dir or Path("output")) / "reference_template.json"
+        print(f"  Analyzing reference video {reference_video.name}...")
+        reference_template = analyze_reference(reference_video, cache_path=cache)
+        # Adopt reference's cut count: if reference has 16 beats in 26s and
+        # user narration is 28s, scale to 16 * 28/26 ~ 17 cuts positioned
+        # proportionally (snap to nearest word boundary for natural feel).
+        if reference_template.beats:
+            ref_total = reference_template.total_duration
+            ref_beats = reference_template.beats
+            scale = transcript.duration / max(1e-6, ref_total)
+            scaled_points = [0.0]
+            for b in ref_beats:
+                t = min(transcript.duration, b.end * scale)
+                if t > scaled_points[-1] + 0.4:
+                    scaled_points.append(round(t, 3))
+            if scaled_points[-1] < transcript.duration - 0.1:
+                scaled_points.append(round(transcript.duration, 3))
+            # Snap each interior point to the nearest word end.
+            word_ends = [w.end for w in transcript.words]
+            snapped = [0.0]
+            for p in scaled_points[1:-1]:
+                if not word_ends:
+                    snapped.append(p)
+                    continue
+                closest = min(word_ends, key=lambda w: abs(w - p))
+                if abs(closest - p) < 0.5 and closest > snapped[-1] + 0.4:
+                    snapped.append(round(closest, 3))
+                elif p > snapped[-1] + 0.4:
+                    snapped.append(p)
+            snapped.append(round(transcript.duration, 3))
+            cut_points = snapped
+        reference_beats_per_cut = align_to_user_timeline(
+            reference_template, transcript.duration, cut_points,
+        )
+
     captions = build_captions(transcript, style)
 
     if use_semantic:
@@ -322,6 +363,18 @@ def build_plan(
         captions_dicts = [{"text": c.text, "start": c.start, "end": c.end} for c in captions]
         narration_text = " ".join(w.text for w in transcript.words)
         words_dicts = [{"start": w.start, "end": w.end, "text": w.text} for w in transcript.words]
+        ref_beats_payload: list | None = None
+        if reference_template and reference_beats_per_cut:
+            ref_beats_payload = []
+            for i, b in enumerate(reference_beats_per_cut):
+                ref_beats_payload.append({
+                    "cut_index": i,
+                    "reference_spoken": b.spoken,
+                    "reference_visual": b.visual_description,
+                    "reference_elements": b.visual_elements,
+                    "reference_emotion": b.emotion,
+                    "reference_phase": b.phase,
+                })
         print("  Matching scenes to cuts with Gemini...")
         scene_ids = match_clips(
             cuts=cuts_tuples,
@@ -331,6 +384,7 @@ def build_plan(
             total_duration=transcript.duration,
             narration_text=narration_text,
             words=words_dicts,
+            reference_beats=ref_beats_payload,
         )
         if output_dir:
             from .matcher import _tag_cuts_with_captions

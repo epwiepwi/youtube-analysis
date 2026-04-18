@@ -340,22 +340,27 @@ def _assign_clips_for_sentence(client: genai.Client, sentence_idx: int,
 - visual_phase: {plan.get("visual_phase", "")}
 - critical: {plan.get("critical", False)}
 
+[참조 영상의 해당 순간 (이것을 모방해야 함)]
+각 컷의 reference_target_visual / reference_target_elements 필드가 있다면, 그것은 이 타이밍에 "잘 편집된 참조 영상이 보여준 장면"이다.
+네 목표는 내 클립 풀에서 **그 참조 장면과 가장 비슷한 클립**을 고르는 것. 참조를 레시피처럼 따라하라.
+
 [키워드 매칭 vs 의미 매칭 — 가장 중요]
 ⚠️ "단어 같다 = 매칭" 절대 아니다. 의미/의도가 같아야 매칭이다.
 
 나쁜 예:
-- "솔루션 도구 등장" 문장에 "외국인이 병뚜껑 못 여는 밈" → 둘 다 "병/뚜껑" 키워드지만 의미 완전 다름. 0점
-- "맛 차이" 문장에 "지폐를 지갑에 넣는 영상" → 무관함. 0점
-- "곰팡이 생긴다" 문장에 "신선한 깍두기" → 정반대. 0점
-- "이걸 덮어준다" (솔루션) 문장에 "그냥 비닐 랩" → 직전 문장에서 비닐이 문제라 했음. 논리 모순. 0점
+- "솔루션 도구 등장" 문장에 "외국인이 병뚜껑 못 여는 밈" → 0점
+- "맛 차이" 문장에 "지폐를 지갑에 넣는 영상" → 무관함, 0점
+- "곰팡이 생긴다" 문장에 "신선한 깍두기" → 정반대, 0점
+- "이걸 덮어준다" (솔루션) 문장에 "그냥 비닐 랩" → 직전 문장이 비닐 문제라 했음. 모순. 0점
 
 [절대 규칙]
-1. visual_intent와 required_elements가 썸네일에 보이는 클립을 골라라.
-2. forbidden_elements가 썸네일에 보이면 0점.
-3. critical=true면 9점 이상만 허용. 9점 이상 없으면 가장 가까운 거 + reason에 "타협" 명시.
-4. 같은 클립을 연속 컷에 배치 금지.
-5. 첫 문장(hook)이면 visual_impact + retention 모두 8↑인 클립 우선.
-6. retention 1-3 클립은 가능한 회피.
+1. reference_target_visual이 있으면 그것과 최대한 닮은 클립을 우선으로 골라라.
+2. 참조가 없거나 본인 클립 풀에 비슷한 게 없으면, visual_intent + required_elements로 판단.
+3. forbidden_elements가 썸네일에 보이면 0점.
+4. critical=true면 9점 이상만 허용. 9점 이상 없으면 가장 가까운 거 + reason에 "타협" 명시.
+5. 같은 클립을 연속 컷에 배치 금지.
+6. 첫 문장(hook)이면 visual_impact + retention 모두 8↑인 클립 우선.
+7. retention 1-3 클립은 가능한 회피.
 
 [배정할 컷 목록]
 {json.dumps(cuts_in_sentence, ensure_ascii=False, indent=2)}
@@ -476,6 +481,7 @@ def match_clips(
     total_duration: float,
     narration_text: str = "",
     words: list[dict] | None = None,
+    reference_beats: list[dict] | None = None,
 ) -> list[str]:
     """Two-stage matching. Filters unusable clips. Returns clip path per cut."""
     if not GEMINI_API_KEY:
@@ -509,6 +515,8 @@ def match_clips(
 
     plans = _plan_sentences(client, sentences_payload, narration_text, style)
 
+    ref_by_cut = {b["cut_index"]: b for b in (reference_beats or [])}
+
     cut_entries = []
     for i, (t_start, t_end) in enumerate(cuts):
         phase = _classify_phase(i, len(cuts), t_start, hook_end, ending_duration, total_duration)
@@ -521,13 +529,20 @@ def match_clips(
             (s["text"] for s in sentences_payload if s["sentence_index"] == owning_idx),
             "",
         )
-        cut_entries.append({
+        ref = ref_by_cut.get(i)
+        entry = {
             "index": i,
             "time": f"{t_start:.2f}-{t_end:.2f}s",
             "phase": phase,
             "owning_sentence_index": owning_idx,
             "owning_sentence_text": owning_text,
-        })
+        }
+        if ref:
+            entry["reference_target_visual"] = ref.get("reference_visual", "")
+            entry["reference_target_elements"] = ref.get("reference_elements", [])
+            entry["reference_target_emotion"] = ref.get("reference_emotion", "")
+            entry["reference_target_phase"] = ref.get("reference_phase", "")
+        cut_entries.append(entry)
 
     paths, reasons = _assign_clips(client, cut_entries, plans, usable, style, narration_text)
 
