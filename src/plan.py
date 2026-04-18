@@ -384,14 +384,20 @@ def build_plan(
         if use_selections and selections:
             # Skip Gemini matching entirely; replay the user's picks.
             recs_path = (output_dir or Path("output")) / "recommendations.json"
-            prior_recs = json.loads(recs_path.read_text(encoding="utf-8")) if recs_path.exists() else []
+            prior: list[dict] = []
+            if recs_path.exists():
+                parsed = json.loads(recs_path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    prior = parsed.get("recommendations", [])
+                elif isinstance(parsed, list):
+                    prior = parsed
             scene_ids: list[str] = []
             for i in range(len(cuts_tuples)):
                 chosen = selections.get(i)
                 if chosen and chosen in clips_analysis:
                     scene_ids.append(chosen)
-                elif prior_recs and i < len(prior_recs) and prior_recs[i].get("candidates"):
-                    scene_ids.append(prior_recs[i]["candidates"][0]["scene_id"])
+                elif prior and i < len(prior) and prior[i].get("candidates"):
+                    scene_ids.append(prior[i]["candidates"][0]["scene_id"])
                 else:
                     scene_ids.append(list(clips_analysis.keys())[i % len(clips_analysis)])
             print(f"  Applied {len(selections)} user selection(s); skipped Gemini matching.")
@@ -415,9 +421,11 @@ def build_plan(
                 cut_entries = getattr(_mc, "last_cut_entries", [])
                 if ranked and cut_entries:
                     print("  Building recommendations + viewer.html...")
-                    recs = build_recommendations(cut_entries, ranked, clips_analysis, output_dir)
-                    save_recommendations(recs, output_dir)
-                    viewer = write_viewer_html(recs, output_dir)
+                    recs, all_scenes = build_recommendations(
+                        cut_entries, ranked, clips_analysis, output_dir,
+                    )
+                    save_recommendations(recs, all_scenes, output_dir)
+                    viewer = write_viewer_html(recs, all_scenes, output_dir)
                     print(f"  -> open {viewer} to review and pick alternates")
         segments = assign_clips_by_ids(cut_points, scene_ids, clips)
     else:
