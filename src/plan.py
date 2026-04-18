@@ -304,6 +304,7 @@ def build_plan(
     use_semantic: bool = False,
     output_dir: Path | None = None,
     reference_video: Path | None = None,
+    use_selections: bool = False,
 ) -> EditPlan:
     clips = load_clips(clip_dir)
     cut_points = compute_cut_points(transcript, style)
@@ -375,21 +376,49 @@ def build_plan(
                     "reference_emotion": b.emotion,
                     "reference_phase": b.phase,
                 })
-        print("  Matching scenes to cuts with Gemini...")
-        scene_ids = match_clips(
-            cuts=cuts_tuples,
-            captions=captions_dicts,
-            clips_analysis=clips_analysis,
-            style=style,
-            total_duration=transcript.duration,
-            narration_text=narration_text,
-            words=words_dicts,
-            reference_beats=ref_beats_payload,
-        )
-        if output_dir:
-            from .matcher import _tag_cuts_with_captions
-            cut_texts = _tag_cuts_with_captions(cuts_tuples, captions_dicts)
-            save_matches(cuts_tuples, cut_texts, scene_ids, output_dir / "matches.json")
+        from .viewer import (build_recommendations, load_selections,
+                             save_recommendations, write_viewer_html)
+
+        selections = load_selections(output_dir) if (output_dir and use_selections) else {}
+
+        if use_selections and selections:
+            # Skip Gemini matching entirely; replay the user's picks.
+            recs_path = (output_dir or Path("output")) / "recommendations.json"
+            prior_recs = json.loads(recs_path.read_text(encoding="utf-8")) if recs_path.exists() else []
+            scene_ids: list[str] = []
+            for i in range(len(cuts_tuples)):
+                chosen = selections.get(i)
+                if chosen and chosen in clips_analysis:
+                    scene_ids.append(chosen)
+                elif prior_recs and i < len(prior_recs) and prior_recs[i].get("candidates"):
+                    scene_ids.append(prior_recs[i]["candidates"][0]["scene_id"])
+                else:
+                    scene_ids.append(list(clips_analysis.keys())[i % len(clips_analysis)])
+            print(f"  Applied {len(selections)} user selection(s); skipped Gemini matching.")
+        else:
+            print("  Matching scenes to cuts with Gemini...")
+            scene_ids = match_clips(
+                cuts=cuts_tuples,
+                captions=captions_dicts,
+                clips_analysis=clips_analysis,
+                style=style,
+                total_duration=transcript.duration,
+                narration_text=narration_text,
+                words=words_dicts,
+                reference_beats=ref_beats_payload,
+            )
+            if output_dir:
+                from .matcher import _tag_cuts_with_captions, match_clips as _mc
+                cut_texts = _tag_cuts_with_captions(cuts_tuples, captions_dicts)
+                save_matches(cuts_tuples, cut_texts, scene_ids, output_dir / "matches.json")
+                ranked = getattr(_mc, "last_ranked", {})
+                cut_entries = getattr(_mc, "last_cut_entries", [])
+                if ranked and cut_entries:
+                    print("  Building recommendations + viewer.html...")
+                    recs = build_recommendations(cut_entries, ranked, clips_analysis, output_dir)
+                    save_recommendations(recs, output_dir)
+                    viewer = write_viewer_html(recs, output_dir)
+                    print(f"  -> open {viewer} to review and pick alternates")
         segments = assign_clips_by_ids(cut_points, scene_ids, clips)
     else:
         segments = assign_clips_to_cuts(cut_points, clips)

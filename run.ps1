@@ -5,7 +5,8 @@ param(
     [string]$Model = "small",
     [string]$Device = "cpu",
     [string]$Reference = "",
-    [switch]$Semantic
+    [switch]$Semantic,
+    [switch]$UseSelections
 )
 
 $OutputEncoding = [System.Text.Encoding]::UTF8
@@ -27,5 +28,6 @@ Write-Host ""
 $extra = @()
 if ($Semantic) { $extra += "--semantic" }
 if ($Reference) { $extra += "--reference"; $extra += "$Reference" }
+if ($UseSelections) { $extra += "--use-selections" }
 
 python -m src.main --narration "$Narration" --clips "$Clips" --name "$Name" @extra

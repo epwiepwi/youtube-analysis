@@ -331,8 +331,11 @@ def _assign_clips_for_sentence(client: genai.Client, sentence_idx: int,
                                 candidate_ids: list[str],
                                 clips_analysis: dict[str, ClipAnalysis],
                                 style: dict, narration_text: str,
-                                tmp_dir: Path) -> dict[int, tuple[str, str, int]]:
-    """Run Stage 2 for ONE sentence. Returns {cut_index: (scene_id, reason, score)}."""
+                                tmp_dir: Path) -> dict[int, list[dict]]:
+    """Run Stage 2 for ONE sentence. Returns {cut_index: [ranked candidates]}.
+
+    Each cut gets up to 3 ranked picks so the HTML viewer can show alternates.
+    """
     style_signature = style.get("capcut_automation_hints", {}).get("style_signature", "")
 
     thumbnails: list[bytes] = []
@@ -405,10 +408,15 @@ def _assign_clips_for_sentence(client: genai.Client, sentence_idx: int,
 
     footer = """
 
-각 컷에 클립을 배정해 JSON으로만 출력. reason에는 (1) 컷의 visual_intent (2) 썸네일에 실제로 보이는 시각 요소 (3) 둘이 어떻게 일치하는지 명시.
+각 컷에 **상위 3개 후보**를 배정해 JSON으로만 출력. reason에는 (1) 컷의 visual_intent (2) 썸네일에 실제로 보이는 시각 요소 (3) 둘이 어떻게 일치하는지 명시.
+2순위/3순위는 1순위가 왜 선택됐는지와 비교해 "대안"이 되어야 한다 (완전히 다른 느낌 말고, 비슷하게 괜찮은 옵션).
 
 {"assignments": [
-  {"cut": <글로벌_cut_index>, "clip_id": "C3", "score": 9, "reason": "..."},
+  {"cut": <글로벌_cut_index>, "picks": [
+      {"clip_id": "C3", "score": 9, "reason": "최우선 이유"},
+      {"clip_id": "C7", "score": 8, "reason": "대안 1"},
+      {"clip_id": "C12", "score": 7, "reason": "대안 2"}
+  ]},
   ...
 ]}
 """
@@ -423,32 +431,54 @@ def _assign_clips_for_sentence(client: genai.Client, sentence_idx: int,
                                       label=f"S2.sent{sentence_idx}")
     id_to_path = {f"C{i}": candidate_ids[i] for i in range(len(candidate_ids))}
 
-    out: dict[int, tuple[str, str, int]] = {}
+    out: dict[int, list[dict]] = {}
     for a in data.get("assignments", []):
         try:
             cut_idx = int(a["cut"])
-            cid = str(a["clip_id"])
-            if cid not in id_to_path:
-                continue
-            out[cut_idx] = (id_to_path[cid], str(a.get("reason", "")), int(a.get("score", 0)))
         except (KeyError, ValueError, TypeError):
             continue
+        picks_raw = a.get("picks")
+        if picks_raw is None and "clip_id" in a:
+            # Back-compat: old single-pick shape.
+            picks_raw = [{"clip_id": a["clip_id"], "score": a.get("score", 0),
+                          "reason": a.get("reason", "")}]
+        ranked: list[dict] = []
+        for p in (picks_raw or []):
+            try:
+                cid = str(p["clip_id"])
+                if cid not in id_to_path:
+                    continue
+                ranked.append({
+                    "scene_id": id_to_path[cid],
+                    "score": _safe_int(p.get("score"), 0),
+                    "reason": str(p.get("reason", "")),
+                })
+            except (KeyError, TypeError):
+                continue
+        if ranked:
+            out[cut_idx] = ranked[:3]
     return out
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[dict],
                   clips_analysis: dict[str, ClipAnalysis], style: dict,
-                  narration_text: str) -> tuple[list[str], list[str]]:
-    """Stage 2 done per-sentence so each Gemini call sees a focused candidate set."""
+                  narration_text: str) -> tuple[list[str], list[str], dict[int, list[dict]]]:
+    """Stage 2 per-sentence. Returns (chosen_paths, reasons, ranked_candidates_by_cut)."""
     plans_by_sent = {p["sentence_index"]: p for p in sentence_plans}
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="match_thumbs_"))
     print(f"  [Stage 2/2] Per-sentence matching ({len(sentence_plans)} sentence(s))...")
 
-    by_cut: dict[int, tuple[str, str, int]] = {}
+    ranked_by_cut: dict[int, list[dict]] = {}
     paths_ordered = list(clips_analysis.keys())
 
-    # Group cuts by sentence.
     cuts_by_sent: dict[int, list[dict]] = {}
     for c in cuts:
         sidx = c.get("owning_sentence_index")
@@ -469,7 +499,7 @@ def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[d
         except Exception as e:
             print(f"    sentence {sidx} FAILED: {e}")
             assignments = {}
-        by_cut.update(assignments)
+        ranked_by_cut.update(assignments)
 
     for f in tmp_dir.glob("*"):
         f.unlink(missing_ok=True)
@@ -481,22 +511,22 @@ def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[d
     result_paths: list[str] = []
     result_reasons: list[str] = []
     for i in range(len(cuts)):
-        entry = by_cut.get(i)
-        if entry is None:
+        picks = ranked_by_cut.get(i)
+        if not picks:
             cid = paths_ordered[i % len(paths_ordered)]
             result_paths.append(cid)
             result_reasons.append("(fallback: matcher skipped this cut)")
         else:
-            sid, reason, score = entry
-            result_paths.append(sid)
-            result_reasons.append(f"[score={score}] {reason}")
+            top = picks[0]
+            result_paths.append(top["scene_id"])
+            result_reasons.append(f"[score={top['score']}] {top['reason']}")
 
     # Hard reuse cap as a safety net for when Gemini ignores the rule.
     result_paths, result_reasons = _enforce_reuse_cap(
         result_paths, result_reasons, clips_analysis, plans_by_sent, cuts,
         max_per_scene=2, max_per_file=2,
     )
-    return result_paths, result_reasons
+    return result_paths, result_reasons, ranked_by_cut
 
 
 def match_clips(
@@ -570,7 +600,9 @@ def match_clips(
             entry["reference_target_phase"] = ref.get("reference_phase", "")
         cut_entries.append(entry)
 
-    paths, reasons = _assign_clips(client, cut_entries, plans, usable, style, narration_text)
+    paths, reasons, ranked = _assign_clips(client, cut_entries, plans, usable, style, narration_text)
+    match_clips.last_ranked = ranked  # type: ignore[attr-defined]
+    match_clips.last_cut_entries = cut_entries  # type: ignore[attr-defined]
 
     # Post-check: warn when the hook slot didn't land a high-impact clip.
     if paths:
