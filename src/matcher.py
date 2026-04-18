@@ -268,35 +268,60 @@ def _enforce_reuse_cap(paths: list[str], reasons: list[str],
                         clips_analysis: dict[str, ClipAnalysis],
                         plans_by_sent: dict[int, dict],
                         cuts: list[dict],
-                        max_reuse: int = 2) -> tuple[list[str], list[str]]:
-    """Replace 3rd+ occurrences of any clip with the best unused alternative."""
-    used: dict[str, int] = {}
+                        max_per_scene: int = 2,
+                        max_per_file: int = 2) -> tuple[list[str], list[str]]:
+    """Swap over-used clips with the best unused alternative.
+
+    Caps are applied on two axes:
+    - per-scene: same scene_id used more than `max_per_scene` times.
+    - per-source-file: same underlying mp4 contributed more than `max_per_file`
+      scenes to the output. Prevents the 'same person appears 3x in different
+      moments from one source file' failure mode.
+    """
+    def file_of(scene_id: str) -> str:
+        a = clips_analysis.get(scene_id)
+        return str(a.source_file) if a else scene_id.split("#")[0]
+
+    scene_uses: dict[str, int] = {}
+    file_uses: dict[str, int] = {}
     for p in paths:
-        used[p] = used.get(p, 0) + 1
+        scene_uses[p] = scene_uses.get(p, 0) + 1
+        file_uses[file_of(p)] = file_uses.get(file_of(p), 0) + 1
 
     new_paths = list(paths)
     new_reasons = list(reasons)
-    for i, p in enumerate(paths):
-        if used[p] <= max_reuse:
+
+    for i, p in enumerate(new_paths):
+        over_scene = scene_uses[p] > max_per_scene
+        over_file = file_uses[file_of(p)] > max_per_file
+        if not (over_scene or over_file):
             continue
-        # This is an over-use. Find an alternative.
         plan = plans_by_sent.get(cuts[i].get("owning_sentence_index"), {})
+        neighbors = set()
+        if i > 0:
+            neighbors.add(new_paths[i - 1])
+        if i + 1 < len(new_paths):
+            neighbors.add(new_paths[i + 1])
         candidates = []
         for sid, a in clips_analysis.items():
-            if used.get(sid, 0) >= max_reuse:
+            if scene_uses.get(sid, 0) >= max_per_scene:
                 continue
-            if sid in (paths[i - 1] if i > 0 else None,
-                      paths[i + 1] if i + 1 < len(paths) else None):
+            if file_uses.get(str(a.source_file), 0) >= max_per_file and str(a.source_file) != file_of(p):
+                continue
+            if sid in neighbors:
                 continue
             candidates.append((_score_scene_for_plan(a, plan), sid))
         if not candidates:
             continue
         candidates.sort(reverse=True)
         new_sid = candidates[0][1]
-        used[p] -= 1
-        used[new_sid] = used.get(new_sid, 0) + 1
+        scene_uses[p] = max(0, scene_uses[p] - 1)
+        scene_uses[new_sid] = scene_uses.get(new_sid, 0) + 1
+        file_uses[file_of(p)] = max(0, file_uses[file_of(p)] - 1)
+        file_uses[file_of(new_sid)] = file_uses.get(file_of(new_sid), 0) + 1
+        reason_tag = "reuse-cap(scene)" if over_scene else "reuse-cap(file)"
         new_paths[i] = new_sid
-        new_reasons[i] = f"[reuse-cap] swapped from over-used clip → {Path(new_sid).name}"
+        new_reasons[i] = f"[{reason_tag}] swapped → {Path(new_sid).name}"
     return new_paths, new_reasons
 
 
