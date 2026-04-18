@@ -191,6 +191,19 @@ def _plan_sentences(client: genai.Client, sentences: list[dict], narration_text:
 [내러티브 템플릿]
 {content_template}
 
+[절대 지켜야 할 원칙 — 내러티브 대조]
+쇼츠의 문제-해결 구조에서 "문제"로 지목된 요소는 "해결책" 문장의 forbidden_elements에 반드시 포함시켜야 한다.
+예:
+- 문장2가 "비닐이 꽉 막아서 곰팡이 생김" (문제 = 비닐) 이라면,
+- 문장3 "이모는 이걸 꾹 덮어준다" (해결)의 forbidden_elements = ["일반 비닐 랩", "얇은 비닐", "싸구려 비닐봉지"]
+- 왜냐면 문제라고 했던 걸 해결책에 다시 보여주면 논리 붕괴. 시청자가 배신감 느낌.
+- 이전 문장들을 모두 읽고 "무엇이 부정적 원인으로 지목됐는지" 파악해 해당 요소를 차단.
+
+또 하나:
+- "맛 있다/맛 차이" 문장엔 먹는 장면/완성된 결과물. 조리/손질 장면 forbidden.
+- "발효/가스 배출" 문장엔 밀폐된 통이나 공기 관련. 먹는 장면/씻는 장면 forbidden.
+- CTA("남겨주세요") 문장엔 제목 키워드 관련 컷. 관계없는 B-roll forbidden.
+
 [작업 — 아래 문장 각각에 대해 시각 계획을 세워라]
 {json.dumps(sentences, ensure_ascii=False, indent=2)}
 
@@ -198,14 +211,15 @@ def _plan_sentences(client: genai.Client, sentences: list[dict], narration_text:
 각 문장마다:
 - visual_intent: 이 순간 화면이 시청자에게 전달해야 할 메시지 (예: "잘못된 보관 방법을 보여줘서 공감 유발")
 - required_elements: 화면에 반드시 보여야 하는 구체 요소 (예: ["비닐", "김치통", "덮는 동작"])
-- forbidden_elements: 화면에 절대 나오면 안 되는 요소 (예: ["깨끗한 결과물", "먹는 장면"])
+- forbidden_elements: 화면에 절대 나오면 안 되는 요소. **선행 문장에서 "문제"로 지목된 것 필수 포함**
+- contrast_with_previous: 앞 문장 대비 무엇이 달라야 하는지 1문장 (예: "앞 문장은 비닐 = 나쁨이므로, 이 문장의 해결책은 비닐이 아닌 다른 도구여야 함")
 - visual_phase: hook | problem | solution | cta | bridge
-- critical: true/false (이 문장이 영상의 결정적 순간인가? — hook 첫 문장, 솔루션 등장, CTA는 critical=true)
+- critical: true/false (hook 첫 문장, 솔루션 등장, CTA는 critical=true)
 - alternates_ok: true/false (꼭 정확한 매칭 아니어도 분위기만 맞으면 OK인 문장인가)
 
 JSON만 출력:
 {{"plans": [
-  {{"sentence_index": 0, "visual_intent": "...", "required_elements": [...], "forbidden_elements": [...], "visual_phase": "hook", "critical": true, "alternates_ok": false}},
+  {{"sentence_index": 0, "visual_intent": "...", "required_elements": [...], "forbidden_elements": [...], "contrast_with_previous": "...", "visual_phase": "hook", "critical": true, "alternates_ok": false}},
   ...
 ]}}
 """
@@ -244,6 +258,7 @@ def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[d
             "visual_intent": (plan or {}).get("visual_intent", ""),
             "required_elements": (plan or {}).get("required_elements", []),
             "forbidden_elements": (plan or {}).get("forbidden_elements", []),
+            "contrast_with_previous": (plan or {}).get("contrast_with_previous", ""),
             "critical": (plan or {}).get("critical", False),
             "alternates_ok": (plan or {}).get("alternates_ok", True),
         })
@@ -258,24 +273,28 @@ def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[d
 [전체 나레이션 — 흐름 파악용]
 {narration_text}
 
-[금지 매칭 예시 — 절대 하지 마라]
-- "보관/덮는다" 문장에 "씻는다/썬다" 클립 → 동작이 다름, 0점
-- "깔끔한 결과" 문장에 "썩은/곰팡이" 클립 → 의미 정반대, 0점
-- "먹다/맛" 문장에 "재료 손질" 클립 → 단계가 다름, 1점
-- "솔루션 도구 등장" 문장(critical=true)에 도구 안 보이는 클립 → 핵심 실패, 1점
-- 어떤 문장에도 outro/로고/워터마크 클립 → 의미 무관, 0점
+[키워드 매칭 vs 의미 매칭 — 가장 중요]
+⚠️ "같은 단어가 있다 = 매칭" 아니다. 의미/의도가 같아야 매칭이다.
 
-[좋은 매칭 예시]
-- "꾹 덮어준다" 문장 → 손이 뚜껑을 누르는 클립
-- "곰팡이 생긴다" 문장 → 부패한 음식 클로즈업
-- "맛이 미쳤다" 문장 → 김치+밥 먹방 클로즈업
+나쁜 예 (키워드만 맞춤):
+- "가스 뱉어내야 한다" 문장에 "김치 위에 쌀밥 올리기" 클립 → 둘 다 "김치" 키워드지만 의미 완전 다름, 0점
+- "이모 솔루션(특별한 덮개)" 문장에 "얇은 비닐 랩 덮기" 클립 → 둘 다 "덮다" 키워드지만 직전 문장에서 비닐이 문제라고 했음. **논리 모순**. 0점
+- "맛 차이가 확 난다" 문장에 "양념 푸기" 클립 → "김치" 공통이지만 "맛 = 먹는 행위/완성된 모습"이 필요, 1점
+
+좋은 예 (의미 일치):
+- "꾹 덮어준다" (솔루션) → 손이 단단한 뚜껑/누름판 누르는 클립 (비닐 랩 NO)
+- "곰팡이 생긴다" (문제) → 곰팡이 핀 음식 클로즈업 (깨끗한 김치 NO)
+- "맛이 미쳤다" (결과) → 먹는 장면/신선한 결과물 (조리 과정 NO)
+- "납품 이모" (권위) → 대량/전문 주방 (가정 주방 NO)
 
 [절대 규칙]
-1. 각 컷의 visual_intent를 먼저 읽고, required_elements가 썸네일에 보이는 클립을 골라라.
-2. forbidden_elements가 보이는 클립은 점수 0으로 취급.
-3. critical=true 컷은 매칭 강도 9점 이상만 허용. 9점 이상 클립 없으면 가장 가까운 거 + reason에 "타협"이라고 명시.
-4. 같은 클립을 연속 2컷에 배치 금지. 같은 문장 내에서도 변화 줘라.
-5. 안 쓰인 클립이 있으면 손해. 가능한 골고루.
+1. 각 컷의 **visual_intent**를 먼저 읽고, required_elements가 썸네일에 보이는 클립을 골라라.
+2. **forbidden_elements가 보이는 클립은 매칭에서 제외.** 점수 0으로 취급.
+3. **contrast_with_previous** 필드를 반드시 확인 — 앞 문장 대비 달라야 할 점. 이걸 위반하면 논리 붕괴.
+4. **critical=true** 컷은 매칭 강도 9점 이상만 허용. 9점 이상 클립 없으면 가장 가까운 거 + reason에 "타협"이라고 명시.
+5. **첫 컷 (cut 0, hook)**: visual_impact 8 이상 클립 중에서 골라라. 충격 없는 클립으로 시작하면 시청자 이탈.
+6. 같은 클립을 연속 2컷에 배치 금지. 같은 문장 내에서도 변화 줘라.
+7. 안 쓰인 클립이 있으면 손해. 가능한 골고루.
 
 [컷 목록 — visual_intent에 맞는 클립을 찾아라]
 {json.dumps(enriched_cuts, ensure_ascii=False, indent=2)}
@@ -394,6 +413,22 @@ def match_clips(
         })
 
     paths, reasons = _assign_clips(client, cut_entries, plans, usable, style, narration_text)
+
+    # Post-check: warn when the hook slot didn't land a high-impact clip.
+    if paths:
+        hook_clip = usable.get(paths[0])
+        if hook_clip and hook_clip.visual_impact < 8:
+            high_impact = [
+                p for p, a in usable.items()
+                if a.visual_impact >= 8 and p != paths[0]
+            ]
+            if high_impact:
+                print(
+                    f"  Warning: hook clip '{Path(paths[0]).name}' has impact "
+                    f"{hook_clip.visual_impact}/10. {len(high_impact)} higher-impact clip(s) "
+                    "were available — matcher may have violated the hook rule."
+                )
+
     match_clips.last_reasons = reasons  # type: ignore[attr-defined]
     match_clips.last_plans = plans  # type: ignore[attr-defined]
     return paths
