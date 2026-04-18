@@ -42,16 +42,34 @@ def _generate_with_retry(client: genai.Client, model: str, contents, max_attempt
 
 
 def _parse_json(text: str) -> dict:
+    """Lenient JSON extraction. Handles ```json fences, trailing commas,
+    single quotes, and truncation around the main object."""
     text = text.strip()
+    # Strip fenced code blocks.
     if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:]
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines)
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1:
-        raise ValueError(f"No JSON in response: {text[:300]}")
-    return json.loads(text[start : end + 1])
+        raise ValueError(f"No JSON object in response: {text[:400]}")
+    body = text[start : end + 1]
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as e1:
+        cleaned = body.replace(",\n}", "\n}").replace(",\n]", "\n]")
+        cleaned = cleaned.replace(",}", "}").replace(",]", "]")
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            raise ValueError(
+                f"JSON decode failed at {e1.lineno}:{e1.colno}. "
+                f"Body around error: ...{body[max(0, e1.pos-80):e1.pos+80]}..."
+            ) from e1
 
 
 def _tag_cuts_with_captions(cuts: list[tuple[float, float]], captions: list[dict]) -> list[str]:
@@ -63,28 +81,42 @@ def _tag_cuts_with_captions(cuts: list[tuple[float, float]], captions: list[dict
 
 
 def _split_sentences(words: list[dict]) -> list[dict]:
+    """Group words into sentence-like units.
+
+    Splits on any of: (a) a speaker pause of >=0.25s, (b) accumulated sentence
+    duration exceeds 4s, or (c) more than 12 words. Keeps sentences at least
+    2 words long so single-word blurts don't create 1-word sentences.
+    """
     if not words:
         return []
     sentences: list[dict] = []
     bucket: list[dict] = [words[0]]
-    gap_threshold = 0.35
-    for prev, cur in zip(words, words[1:]):
-        gap = cur["start"] - prev["end"]
-        if gap >= gap_threshold and len(bucket) >= 3:
-            sentences.append({
-                "start": bucket[0]["start"],
-                "end": bucket[-1]["end"],
-                "text": " ".join(w["text"] for w in bucket).strip(),
-            })
-            bucket = [cur]
-        else:
-            bucket.append(cur)
-    if bucket:
+    gap_threshold = 0.25
+    max_duration = 4.0
+    max_words = 12
+
+    def flush():
+        nonlocal bucket
         sentences.append({
             "start": bucket[0]["start"],
             "end": bucket[-1]["end"],
             "text": " ".join(w["text"] for w in bucket).strip(),
         })
+        bucket = []
+
+    for prev, cur in zip(words, words[1:]):
+        gap = cur["start"] - prev["end"]
+        duration = bucket[-1]["end"] - bucket[0]["start"] if bucket else 0.0
+        should_split = (
+            (gap >= gap_threshold and len(bucket) >= 2)
+            or duration >= max_duration
+            or len(bucket) >= max_words
+        )
+        if should_split:
+            flush()
+        bucket.append(cur)
+    if bucket:
+        flush()
     return sentences
 
 
@@ -120,6 +152,26 @@ def _extract_thumbnail(clip_path: Path, tmp_dir: Path) -> Path:
         check=True,
     )
     return out
+
+
+def _generate_json_with_retry(client: genai.Client, model: str, contents,
+                               label: str = "call", max_json_retries: int = 2) -> dict:
+    """Wrapper that retries on malformed JSON output."""
+    last_error = None
+    for attempt in range(max_json_retries + 1):
+        resp = _generate_with_retry(client, model, contents)
+        try:
+            return _parse_json(resp.text)
+        except ValueError as e:
+            last_error = e
+            print(f"  [{label}] JSON parse failed (attempt {attempt + 1}): {e}")
+            if attempt < max_json_retries:
+                # On retry, append a stern reminder to the prompt.
+                if isinstance(contents, str):
+                    contents = contents + "\n\n반드시 유효한 JSON 하나만 출력해. 다른 텍스트 금지. 모든 문자열은 큰따옴표. 트레일링 콤마 금지."
+                elif isinstance(contents, list):
+                    contents = contents + ["\n\n반드시 유효한 JSON 하나만 출력해. 다른 텍스트 금지. 모든 문자열은 큰따옴표. 트레일링 콤마 금지."]
+    raise last_error  # type: ignore[misc]
 
 
 def _plan_sentences(client: genai.Client, sentences: list[dict], narration_text: str,
@@ -158,8 +210,7 @@ JSON만 출력:
 ]}}
 """
     print(f"  [Stage 1/2] Planning visuals for {len(sentences)} sentences...")
-    resp = _generate_with_retry(client, GEMINI_TEXT_MODEL, prompt)
-    data = _parse_json(resp.text)
+    data = _generate_json_with_retry(client, GEMINI_TEXT_MODEL, prompt, label="Stage1")
     return data.get("plans", [])
 
 
@@ -254,13 +305,11 @@ def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[d
     parts.append(footer)
 
     print(f"  Matching {len(cuts)} cuts to {len(paths_ordered)} usable clips...")
-    resp = _generate_with_retry(client, GEMINI_TEXT_MODEL, parts)
+    data = _generate_json_with_retry(client, GEMINI_TEXT_MODEL, parts, label="Stage2")
 
     for f in tmp_dir.glob("*"):
         f.unlink(missing_ok=True)
     tmp_dir.rmdir()
-
-    data = _parse_json(resp.text)
     id_to_path = {f"C{i}": paths_ordered[i] for i in range(len(paths_ordered))}
 
     assignments = data.get("assignments", [])
