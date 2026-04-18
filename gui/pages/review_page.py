@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtCore import QUrl
+from PyQt6.QtWebEngineCore import QWebEngineDownloadRequest
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QFileDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton,
@@ -13,8 +14,6 @@ from PyQt6.QtWidgets import (
 
 
 class ReviewPage(QWidget):
-    regenerate_requested = None  # set by MainWindow; simple attribute holder
-
     def __init__(self, on_regenerate=None):
         super().__init__()
         self._on_regenerate = on_regenerate
@@ -30,7 +29,7 @@ class ReviewPage(QWidget):
         header.addWidget(title)
         header.addStretch()
 
-        import_btn = QPushButton("selections.json 불러오기")
+        import_btn = QPushButton("selections.json 수동 불러오기")
         import_btn.setProperty("class", "secondary")
         import_btn.clicked.connect(self._import_selections)
         header.addWidget(import_btn)
@@ -41,11 +40,15 @@ class ReviewPage(QWidget):
         header.addWidget(regen_btn)
         layout.addLayout(header)
 
-        self.hint = QLabel("뷰어가 여기에 표시돼요. 썸네일 클릭으로 선택 → 다운로드 버튼으로 selections.json 저장 → 위 버튼으로 재생성.")
+        self.hint = QLabel("뷰어가 여기에 표시돼요. 썸네일 클릭으로 선택 → 'selections.json 다운로드' 누르면 자동으로 저장됨 → 위 '재생성' 버튼으로 완성.")
         self.hint.setProperty("class", "sectionSub")
         layout.addWidget(self.hint)
 
         self.web = QWebEngineView()
+        # Hook the browser's download requests so "selections.json 다운로드"
+        # in the embedded viewer writes straight into the project's output
+        # folder instead of popping a useless save dialog.
+        self.web.page().profile().downloadRequested.connect(self._on_download)
         layout.addWidget(self.web, 1)
 
     def load_viewer(self, output_dir: Path) -> None:
@@ -57,8 +60,35 @@ class ReviewPage(QWidget):
         self.web.load(QUrl.fromLocalFile(str(viewer.resolve())))
         self.hint.setText(
             "썸네일 클릭 = 선택. '전체 풀에서 고르기'로 모든 장면 탐색. "
-            "맨 아래 'selections.json 다운로드' 누르고 위의 '불러오기' 버튼으로 가져오세요."
+            "뷰어 하단 'selections.json 다운로드' 누르면 작업 폴더에 자동 저장됩니다."
         )
+
+    def _on_download(self, request: QWebEngineDownloadRequest) -> None:
+        if not self._output_dir:
+            request.cancel()
+            return
+        filename = request.downloadFileName() or "selections.json"
+        # Always land in the project's output dir so -UseSelections sees it.
+        target_name = "selections.json" if filename.endswith(".json") else filename
+        request.setDownloadDirectory(str(self._output_dir))
+        request.setDownloadFileName(target_name)
+        request.accept()
+        request.isFinishedChanged.connect(
+            lambda req=request: self._on_download_finished(req)
+        )
+
+    def _on_download_finished(self, request: QWebEngineDownloadRequest) -> None:
+        if not request.isFinished():
+            return
+        state = request.state()
+        if state == QWebEngineDownloadRequest.DownloadState.DownloadCompleted:
+            saved = Path(request.downloadDirectory()) / request.downloadFileName()
+            QMessageBox.information(
+                self, "selections.json 저장됨",
+                f"저장 위치: {saved}\n\n이제 상단의 '선택대로 CapCut 재생성' 버튼을 누르세요.",
+            )
+        elif state == QWebEngineDownloadRequest.DownloadState.DownloadInterrupted:
+            QMessageBox.warning(self, "다운로드 실패", "selections.json 저장에 실패했어요.")
 
     def _import_selections(self) -> None:
         if not self._output_dir:
@@ -78,7 +108,7 @@ class ReviewPage(QWidget):
             return
         if not (self._output_dir / "selections.json").exists():
             QMessageBox.warning(self, "선택 파일 없음",
-                                "selections.json이 작업 폴더에 없어요. 뷰어에서 선택 후 '불러오기'로 저장하세요.")
+                                "selections.json이 작업 폴더에 없어요. 뷰어에서 '다운로드' 버튼을 먼저 누르세요.")
             return
         if self._on_regenerate:
             self._on_regenerate()
