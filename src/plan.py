@@ -225,6 +225,7 @@ def build_plan(
         cuts_tuples = [(cut_points[i], cut_points[i + 1]) for i in range(len(cut_points) - 1)]
         captions_dicts = [{"text": c.text, "start": c.start, "end": c.end} for c in captions]
         narration_text = " ".join(w.text for w in transcript.words)
+        words_dicts = [{"start": w.start, "end": w.end, "text": w.text} for w in transcript.words]
         print("  Matching clips to cuts with Gemini...")
         clip_paths = match_clips(
             cuts=cuts_tuples,
@@ -233,6 +234,7 @@ def build_plan(
             style=style,
             total_duration=transcript.duration,
             narration_text=narration_text,
+            words=words_dicts,
         )
         if output_dir:
             from .matcher import _tag_cuts_with_captions

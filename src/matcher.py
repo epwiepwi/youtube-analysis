@@ -56,6 +56,60 @@ def _tag_cuts_with_captions(cuts: list[tuple[float, float]], captions: list[dict
     return texts
 
 
+def _split_sentences(words: list[dict]) -> list[dict]:
+    """Group words into sentence-like units based on gaps between word ends and next starts.
+    words: list of {"start": float, "end": float, "text": str}
+    Returns list of {"start": float, "end": float, "text": str}
+    """
+    if not words:
+        return []
+    sentences: list[dict] = []
+    bucket: list[dict] = [words[0]]
+    gap_threshold = 0.35
+    for prev, cur in zip(words, words[1:]):
+        gap = cur["start"] - prev["end"]
+        if gap >= gap_threshold and len(bucket) >= 3:
+            sentences.append({
+                "start": bucket[0]["start"],
+                "end": bucket[-1]["end"],
+                "text": " ".join(w["text"] for w in bucket).strip(),
+            })
+            bucket = [cur]
+        else:
+            bucket.append(cur)
+    if bucket:
+        sentences.append({
+            "start": bucket[0]["start"],
+            "end": bucket[-1]["end"],
+            "text": " ".join(w["text"] for w in bucket).strip(),
+        })
+    return sentences
+
+
+def _context_for_cut(cut_start: float, cut_end: float, words: list[dict],
+                      sentences: list[dict], window: int = 8) -> dict:
+    """Build rich context: words spoken in this cut, window before/after, owning sentence."""
+    spoken = [w for w in words if cut_start <= w["start"] < cut_end]
+    if not spoken:
+        nearest = min(words, key=lambda w: abs(w["start"] - cut_start))
+        idx = words.index(nearest)
+    else:
+        idx = words.index(spoken[0])
+    last_idx = words.index(spoken[-1]) if spoken else idx
+    before = words[max(0, idx - window):idx]
+    after = words[last_idx + 1:last_idx + 1 + window]
+    owning = next(
+        (s for s in sentences if s["start"] <= (cut_start + cut_end) / 2 <= s["end"]),
+        None,
+    )
+    return {
+        "spoken_here": " ".join(w["text"] for w in spoken) or "(silence)",
+        "context_before": " ".join(w["text"] for w in before),
+        "context_after": " ".join(w["text"] for w in after),
+        "full_sentence": owning["text"] if owning else "",
+    }
+
+
 def _classify_phase(cut_index: int, total_cuts: int, t_start: float, hook_end: float,
                     ending_duration: float, total_duration: float) -> str:
     if t_start < hook_end:
@@ -97,8 +151,14 @@ def match_clips(
     style: dict,
     total_duration: float,
     narration_text: str = "",
+    words: list[dict] | None = None,
 ) -> list[str]:
-    """Return a list of clip paths, one per cut, in cut order."""
+    """Return a list of clip paths, one per cut, in cut order.
+
+    Matching is sentence-anchored: each cut carries its owning sentence plus
+    a short word window before/after. The prompt tells Gemini to pick based
+    on that sentence's meaning, not on the 1-2 word display caption.
+    """
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set.")
     client = genai.Client(api_key=GEMINI_API_KEY)
@@ -106,16 +166,21 @@ def match_clips(
     hook_end = float(style.get("hook", {}).get("opening_duration_sec", 2.0))
     ending_duration = float(style.get("ending", {}).get("duration_sec", 3.0))
 
-    cut_texts = _tag_cuts_with_captions(cuts, captions)
+    words = words or []
+    sentences = _split_sentences(words)
+
     cut_entries = []
-    for i, ((t_start, t_end), text) in enumerate(zip(cuts, cut_texts)):
+    for i, (t_start, t_end) in enumerate(cuts):
         phase = _classify_phase(i, len(cuts), t_start, hook_end, ending_duration, total_duration)
+        ctx = _context_for_cut(t_start, t_end, words, sentences)
         cut_entries.append({
             "index": i,
-            "start": round(t_start, 2),
-            "end": round(t_end, 2),
-            "caption": text,
+            "time": f"{t_start:.2f}-{t_end:.2f}s",
             "phase": phase,
+            "spoken_here": ctx["spoken_here"],
+            "full_sentence": ctx["full_sentence"],
+            "context_before": ctx["context_before"],
+            "context_after": ctx["context_after"],
         })
 
     paths_ordered = list(clips_analysis.keys())
@@ -135,7 +200,19 @@ def match_clips(
     content_template = style.get("content_structure", {}).get("template", "")
     hook_tactics = "; ".join(style.get("hook", {}).get("retention_tactics", []))
 
-    header = f"""너는 최고 수준의 짜집기 쇼츠 편집자다. 내가 주는 자막 흐름과 실제 클립 썸네일을 보고, 각 컷에 시각적으로 가장 어울리는 클립을 고른다.
+    sentences_json = json.dumps(
+        [{"start": round(s["start"], 2), "end": round(s["end"], 2), "text": s["text"]}
+         for s in sentences],
+        ensure_ascii=False, indent=2,
+    )
+
+    header = f"""너는 최고 수준의 짜집기 쇼츠 편집자다. 전체 스토리는 참고만 하고, **각 컷의 "full_sentence"가 말하는 내용에 어울리는 클립**을 고른다.
+
+[전체 스토리 (참고용, 큰 흐름 파악만)]
+{narration_text}
+
+[문장 단위 분해 (이것이 진짜 매칭 기준)]
+{sentences_json}
 
 [편집 스타일 시그니처]
 {style_signature}
@@ -146,18 +223,17 @@ def match_clips(
 [훅 전략]
 {hook_tactics}
 
-[전체 나레이션 (맥락 파악용)]
-{narration_text}
+[절대 규칙 — 순서대로 적용]
+1. **매칭 기준은 컷의 "full_sentence"이다.** 그 문장이 무엇을 말하는지 파악하고, 그 의미에 맞는 클립을 골라라. "spoken_here" 1-2어절만 보고 결정하지 마라.
+2. 문장이 말하는 **명사/동사/상태가 실제로 썸네일에 보이는지** 확인. 예: 문장이 "양파 껍질 벗기면 곰팡이가 있다"면 곰팡이/껍질/양파가 보이는 클립.
+3. **같은 문장 내 여러 컷**은 같은 주제를 다루므로, 변화를 주되 그 문장 주제를 벗어나지 마라 (다양한 각도/상세컷 느낌).
+4. phase=hook(맨 앞 {hook_end}s)은 visual_impact 8+이고 즉각 시선을 끄는 클립.
+5. phase=problem은 부정/경고/지저분한 장면. phase=solution은 깔끔/정돈/만족감 장면.
+6. **문장 의미와 정반대 클립 절대 금지.** "신세계다" 문장에 썩은 양파 같은 건 0점.
+7. 연속 컷에 같은 클립 쓰지 마라 (최소 2컷 간격).
+8. 안 쓰인 클립이 있으면 낭비다. 가능한 골고루 써라.
 
-[절대 규칙]
-1. 자막이 말하는 대상(명사/동사)이 실제로 화면에 보이는 클립을 최우선으로 골라라. 예: 자막이 "썩은 양파"면 곰팡이/썩은 모습이 보이는 클립, "주부"면 사람이 등장하는 클립.
-2. phase=hook(맨 앞 {hook_end}s)은 visual_impact 8+이고 썸네일이 즉각 시선을 끄는 클립으로 시작.
-3. phase=problem은 부정/경고/지저분한 장면. phase=solution은 깔끔/정돈/만족감 장면. 썸네일 색감과 상황으로 판별.
-4. 같은 클립을 연속 컷에 넣지 마라. 최소 2컷 간격.
-5. 모든 클립을 최소 1번은 쓰려고 시도해라 (안 쓰이는 게 있으면 낭비).
-6. 클립 내용과 자막이 정반대일 땐 절대 쓰지 마라 (예: "신세계" 자막에 썩은 양파 썸네일).
-
-[컷 목록]
+[컷 목록 — 각 컷의 full_sentence를 핵심 기준으로 사용]
 {json.dumps(cut_entries, ensure_ascii=False, indent=2)}
 
 [사용 가능한 클립 — 아래에 각 클립의 썸네일 이미지가 순서대로 첨부됨]
@@ -169,12 +245,11 @@ def match_clips(
 
     footer = """
 
-위 클립 목록 이미지를 모두 본 뒤, 각 컷마다 가장 어울리는 클립을 JSON으로만 출력해.
-각 assignment에 reason(왜 이 클립을 골랐는지, 썸네일에서 본 실제 시각 요소 기반) 반드시 포함.
-다른 설명 금지, JSON만:
+위 모든 썸네일을 본 뒤, 각 컷의 full_sentence 의미에 가장 어울리는 클립을 JSON으로만 출력해.
+reason에는 반드시: (1) 해당 문장이 말하는 것, (2) 썸네일에 실제로 보이는 시각 요소, (3) 왜 둘이 맞는지.
 
 {"assignments": [
-  {"cut": 0, "clip_id": "C3", "reason": "썸네일에 썩은 양파가 보이고 자막이 '썩은 양파'라서 정확히 일치"},
+  {"cut": 0, "clip_id": "C3", "reason": "문장 '혹시 양파 망째로 보관하시면'→양파와 보관이 주제 / 썸네일에 망에 담긴 양파 보임 / 정확히 일치"},
   ...
 ]}
 """
