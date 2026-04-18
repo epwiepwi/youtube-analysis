@@ -207,7 +207,10 @@ def build_draft_content(plan: EditPlan) -> dict:
     video_segments: list[dict] = []
 
     for seg in plan.video_segments:
-        mat = _video_material(seg.clip.path, us(seg.clip.duration))
+        # CapCut needs the FILE's full duration on the material, not the scene
+        # length, otherwise source_timerange offsets beyond the scene won't render.
+        full_duration = seg.clip.file_duration or seg.clip.duration
+        mat = _video_material(seg.clip.path, us(full_duration))
         canvas = _canvas_material()
         videos.append(mat)
         canvases.append(canvas)
@@ -292,7 +295,7 @@ def build_meta_info(project_name: str, plan: EditPlan) -> dict:
                                     "filter_type": 0, "id": new_id(), "import_time": now_us,
                                     "import_time_ms": now_us // 1000,
                                     "item_source": 1, "md5": "", "metetype": "video",
-                                    "roughcut_time_range": {"duration": us(s.clip.duration), "start": 0},
+                                    "roughcut_time_range": {"duration": us(s.clip.file_duration or s.clip.duration), "start": 0},
                                     "sub_time_range": {"duration": -1, "start": -1},
                                     "type": 0, "file_Path": str(s.clip.path)}
                                    for s in plan.video_segments]},

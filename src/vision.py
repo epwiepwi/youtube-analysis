@@ -1,8 +1,9 @@
-"""Clip content analyzer using Gemini Vision.
+"""Scene content analyzer using Gemini Vision.
 
-For each clip: extract a few representative frames with ffmpeg, send them to
-Gemini, and cache the returned description + tags + visual_impact score so we
-only pay for each clip once.
+Each Clip is a sub-scene of a source file (path + start + end). We pull a few
+frames from inside that scene, send them to Gemini, and cache the returned
+description + retention scoring. With scene-level granularity, a 9-minute
+source produces many candidates instead of one.
 """
 
 from __future__ import annotations
@@ -20,14 +21,19 @@ from google.genai import errors as genai_errors
 from google.genai import types
 
 from .config import GEMINI_API_KEY, GEMINI_VISION_MODEL
+from .plan import Clip
 
 
 @dataclass
 class ClipAnalysis:
-    path: str
-    description: str
+    path: str  # Clip.id (file#start-end)
+    source_file: str = ""
+    start: float = 0.0
+    end: float = 0.0
+    description: str = ""
     tags: list[str] = field(default_factory=list)
     visual_impact: int = 5
+    retention_value: int = 5
     emotion: str = "neutral"
     suitability: dict[str, int] = field(default_factory=dict)
     usable: bool = True
@@ -35,31 +41,38 @@ class ClipAnalysis:
     skip_reason: str = ""
 
 
-ANALYSIS_PROMPT = """이 영상 클립의 프레임 여러 장을 보고 JSON으로만 답해줘. 한국어로 작성.
+ANALYSIS_PROMPT = """이 영상 씬(scene)의 프레임 여러 장을 보고 JSON으로만 답해줘. 한국어로.
 
-**1단계: usable 판정 — 매우 보수적으로**
-기본값은 usable=true. 다음 중 하나가 명백할 때만 usable=false:
-- 화면의 80% 이상이 채널 로고/프로필 사진 한 장으로 정적 (콘텐츠 영상 없음)
-- "구독해주세요" 같은 안내 텍스트만 있고 실제 영상 콘텐츠가 거의 없음
-- 검은 화면 / 단색 화면 / 화면 전환 효과만 있음
-- 같은 정지 이미지가 모든 프레임에 동일 (실질적으로 정지 화면)
+너는 짜집기 쇼츠 편집자가 인서트로 쓸지 말지 판단하는 중이다. 시청자가 이 화면을 보고 다음 컷까지 멈추지 않을지가 핵심.
 
-⚠️ 중요: 다음 경우는 usable=true로 유지:
-- 워터마크/채널마크가 작게 박혀있어도 영상 콘텐츠가 있으면 usable=true
-- 외국어 자막이 있어도 영상 콘텐츠가 있으면 usable=true
-- 손/도구만 보여도 사물/행동이 있으면 usable=true
-- 짧은 클립이라도 무언가 행동/사물이 보이면 usable=true
+**1단계: usable 판정 — 매우 보수적**
+기본값 usable=true. 다음일 때만 false:
+- 화면 80%+가 채널 로고/프로필 정적 이미지
+- "구독해주세요" 안내만 있고 영상 콘텐츠 없음
+- 검은/단색 화면, 화면 전환 효과만
+- 모든 프레임이 동일한 정지 이미지
 
-**2단계: 콘텐츠 클립인 경우 (usable=true)**
+usable=true 유지:
+- 작은 워터마크/외국어 자막 있어도 콘텐츠가 있으면 OK
+- 손/도구만 보여도 사물·행동이 있으면 OK
+
+**2단계: 콘텐츠 씬이면 풍부하게 분석**
+
+특히 retention_value (시청자 유지력)는:
+- 10: 즉각 시선 강탈 (충격, 클로즈업, 극적 변화, 얼굴 표정)
+- 7-9: 명확한 행동/사건 진행 중 (요리, 손 움직임, 결과물 등장)
+- 4-6: 정보는 있지만 정적 (배경, 풀샷, 평범한 일상)
+- 1-3: 지루함, 의미 모호, 시청자가 떠날 위험
 
 {
   "usable": true 또는 false,
   "clip_type": "content | outro | intro | logo | watermark | transition_only | thumbnail | other",
   "skip_reason": "usable=false인 경우만 짧게 사유. true면 빈 문자열",
-  "description": "이 클립에서 실제로 보이는 것 2-3문장. 인물(성별/행동), 등장 사물, 배경, 분위기 포함",
-  "tags": ["구체적 키워드 5-8개 — 사물명, 행동, 상태"],
-  "visual_impact": 1-10 (시각적 충격/자극도),
-  "emotion": "shock | warning | calm | clean | disgusting | action | mundane 중 하나",
+  "description": "이 씬에서 실제로 보이는 것 2-3문장. 인물(성별/행동), 등장 사물, 배경, 분위기 포함",
+  "tags": ["구체적 키워드 5-8개 — 사물명/행동/상태"],
+  "visual_impact": 1-10 (시각 자극도),
+  "retention_value": 1-10 (시청자가 멈추고 보게 되는 정도),
+  "emotion": "shock | warning | calm | clean | disgusting | action | mundane",
   "suitability": {
     "hook": 0-10,
     "problem": 0-10,
@@ -71,29 +84,22 @@ ANALYSIS_PROMPT = """이 영상 클립의 프레임 여러 장을 보고 JSON으
 다른 설명 없이 JSON만 출력."""
 
 
-def _extract_frames(clip_path: Path, count: int = 3) -> list[Path]:
-    duration = _probe_duration(clip_path)
-    tmp_dir = Path(tempfile.mkdtemp(prefix="clipframes_"))
+def _extract_scene_frames(clip: Clip, count: int = 3) -> list[Path]:
+    """Pull `count` evenly-spaced frames from inside the scene's time range."""
+    tmp_dir = Path(tempfile.mkdtemp(prefix="sceneframes_"))
     frames: list[Path] = []
+    duration = max(0.5, clip.duration)
     for i in range(count):
-        t = duration * (i + 1) / (count + 1)
+        offset = duration * (i + 1) / (count + 1)
+        t = clip.start + offset
         out = tmp_dir / f"frame_{i}.jpg"
         subprocess.run(
             ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.2f}",
-             "-i", str(clip_path), "-frames:v", "1", "-q:v", "4", str(out)],
+             "-i", str(clip.path), "-frames:v", "1", "-q:v", "4", str(out)],
             check=True,
         )
         frames.append(out)
     return frames
-
-
-def _probe_duration(path: Path) -> float:
-    out = subprocess.check_output(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-        text=True,
-    )
-    return float(out.strip())
 
 
 def _clip_signature(clip_path: Path) -> str:
@@ -105,9 +111,12 @@ def _clip_signature(clip_path: Path) -> str:
 def _parse_json(text: str) -> dict:
     text = text.strip()
     if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:]
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines)
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1:
@@ -130,8 +139,8 @@ def _generate_with_retry(client: genai.Client, model: str, contents, max_attempt
             raise
 
 
-def analyze_clip(clip_path: Path, client: genai.Client) -> ClipAnalysis:
-    frames = _extract_frames(clip_path, count=3)
+def analyze_scene(clip: Clip, client: genai.Client) -> ClipAnalysis:
+    frames = _extract_scene_frames(clip, count=3)
     parts: list = [ANALYSIS_PROMPT]
     for f in frames:
         parts.append(types.Part.from_bytes(data=f.read_bytes(), mime_type="image/jpeg"))
@@ -140,10 +149,14 @@ def analyze_clip(clip_path: Path, client: genai.Client) -> ClipAnalysis:
     for f in frames:
         f.unlink(missing_ok=True)
     return ClipAnalysis(
-        path=str(clip_path),
+        path=clip.id,
+        source_file=str(clip.path),
+        start=clip.start,
+        end=clip.end,
         description=str(data.get("description", "")),
         tags=[str(t) for t in data.get("tags", [])],
         visual_impact=int(data.get("visual_impact", 5)),
+        retention_value=int(data.get("retention_value", 5)),
         emotion=str(data.get("emotion", "neutral")),
         suitability={k: int(v) for k, v in (data.get("suitability") or {}).items()},
         usable=bool(data.get("usable", True)),
@@ -152,7 +165,8 @@ def analyze_clip(clip_path: Path, client: genai.Client) -> ClipAnalysis:
     )
 
 
-def build_clips_index(clip_paths: list[Path], cache_path: Path) -> dict[str, ClipAnalysis]:
+def build_clips_index(clips: list[Clip], cache_path: Path) -> dict[str, ClipAnalysis]:
+    """Analyze each scene. Cached by source file signature + scene range."""
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set. Create .env with GEMINI_API_KEY=... or skip semantic matching.")
     client = genai.Client(api_key=GEMINI_API_KEY)
@@ -164,24 +178,25 @@ def build_clips_index(clip_paths: list[Path], cache_path: Path) -> dict[str, Cli
             cache = {}
 
     result: dict[str, ClipAnalysis] = {}
-    dirty = False
-    prompt_version = "v4"
-    for cp in clip_paths:
-        sig = _clip_signature(cp)
-        key = f"{prompt_version}:{cp.name}:{sig[:12]}"
+    prompt_version = "v5"
+
+    # Group scenes by file so we only signature-hash each file once.
+    sigs: dict[Path, str] = {}
+    for c in clips:
+        if c.path not in sigs:
+            sigs[c.path] = _clip_signature(c.path)
+
+    for i, clip in enumerate(clips):
+        sig = sigs[clip.path]
+        key = f"{prompt_version}:{clip.path.name}:{sig[:12]}:{clip.start:.2f}-{clip.end:.2f}"
         if key in cache:
-            result[str(cp)] = ClipAnalysis(**cache[key])
+            result[clip.id] = ClipAnalysis(**cache[key])
             continue
-        print(f"  Analyzing {cp.name}...")
-        analysis = analyze_clip(cp, client)
-        result[str(cp)] = analysis
+        print(f"  [{i + 1}/{len(clips)}] Analyzing {clip.path.name} {clip.start:.1f}-{clip.end:.1f}s...")
+        analysis = analyze_scene(clip, client)
+        result[clip.id] = analysis
         cache[key] = asdict(analysis)
-        dirty = True
-        # Persist after every successful clip so a later failure doesn't lose work.
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    if dirty:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
     return result

@@ -141,14 +141,15 @@ def _probe_duration(path: Path) -> float:
     return float(out.strip())
 
 
-def _extract_thumbnail(clip_path: Path, tmp_dir: Path) -> Path:
-    duration = _probe_duration(clip_path)
-    t = duration * 0.5
-    out = tmp_dir / f"{clip_path.stem}_thumb.jpg"
+def _extract_thumbnail(source_file: Path, scene_start: float, scene_end: float,
+                       tmp_dir: Path, slug: str) -> Path:
+    """Pull a thumbnail from the middle of a scene's range inside its source file."""
+    t = scene_start + max(0.0, (scene_end - scene_start) / 2)
+    out = tmp_dir / f"{slug}_thumb.jpg"
     subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.2f}",
-         "-i", str(clip_path), "-frames:v", "1", "-vf", "scale=480:-1",
-         "-q:v", "5", str(out)],
+         "-i", str(source_file), "-frames:v", "1", "-vf", "scale=320:-1",
+         "-q:v", "6", str(out)],
         check=True,
     )
     return out
@@ -238,14 +239,17 @@ def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[d
     paths_ordered = list(clips_analysis.keys())
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="match_thumbs_"))
-    print(f"  [Stage 2/2] Extracting {len(paths_ordered)} thumbnails...")
+    print(f"  [Stage 2/2] Extracting {len(paths_ordered)} scene thumbnails...")
     thumbnails: list[bytes] = []
-    for p in paths_ordered:
+    for i, scene_id in enumerate(paths_ordered):
+        a = clips_analysis[scene_id]
         try:
-            thumb = _extract_thumbnail(Path(p), tmp_dir)
+            thumb = _extract_thumbnail(
+                Path(a.source_file), a.start, a.end, tmp_dir, slug=f"s{i}"
+            )
             thumbnails.append(thumb.read_bytes())
         except Exception as e:
-            print(f"    thumbnail failed for {Path(p).name}: {e}")
+            print(f"    thumbnail failed for {scene_id}: {e}")
             thumbnails.append(b"")
 
     plans_by_sent = {p["sentence_index"]: p for p in sentence_plans}
@@ -292,9 +296,11 @@ def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[d
 2. **forbidden_elements가 보이는 클립은 매칭에서 제외.** 점수 0으로 취급.
 3. **contrast_with_previous** 필드를 반드시 확인 — 앞 문장 대비 달라야 할 점. 이걸 위반하면 논리 붕괴.
 4. **critical=true** 컷은 매칭 강도 9점 이상만 허용. 9점 이상 클립 없으면 가장 가까운 거 + reason에 "타협"이라고 명시.
-5. **첫 컷 (cut 0, hook)**: visual_impact 8 이상 클립 중에서 골라라. 충격 없는 클립으로 시작하면 시청자 이탈.
-6. 같은 클립을 연속 2컷에 배치 금지. 같은 문장 내에서도 변화 줘라.
-7. 안 쓰인 클립이 있으면 손해. 가능한 골고루.
+5. **첫 컷 (cut 0, hook)**: visual_impact 8 이상 + retention 8 이상 클립만 사용. 충격 없는 클립으로 시작하면 시청자 이탈.
+6. 같은 클립(같은 scene_id)을 한 영상에서 **최대 2번까지만** 사용. 3번째부터는 다른 클립 강제.
+7. 같은 클립을 연속 2컷에 배치 금지. 같은 문장 내에서도 변화 줘라.
+8. retention_value 가 낮은 (1-3) 클립은 가능한 피해라. 시청자 이탈 위험.
+9. 안 쓰인 클립이 있으면 손해. 가능한 골고루.
 
 [컷 목록 — visual_intent에 맞는 클립을 찾아라]
 {json.dumps(enriched_cuts, ensure_ascii=False, indent=2)}
@@ -302,9 +308,15 @@ def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[d
 [사용 가능한 클립 — 아래에 썸네일 첨부]
 """
 
-    for i, path in enumerate(paths_ordered):
-        a = clips_analysis[path]
-        header += f"\nC{i}: {Path(path).name}\n  desc: {a.description}\n  tags: {a.tags}\n  emotion: {a.emotion} / impact: {a.visual_impact}/10\n"
+    for i, scene_id in enumerate(paths_ordered):
+        a = clips_analysis[scene_id]
+        retention = getattr(a, "retention_value", a.visual_impact)
+        header += (
+            f"\nC{i}: {scene_id}\n"
+            f"  desc: {a.description}\n"
+            f"  tags: {a.tags}\n"
+            f"  emotion: {a.emotion} / impact: {a.visual_impact}/10 / retention: {retention}/10\n"
+        )
 
     footer = """
 
