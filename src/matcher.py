@@ -229,90 +229,145 @@ JSON만 출력:
     return data.get("plans", [])
 
 
-def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[dict],
-                  clips_analysis: dict[str, ClipAnalysis], style: dict,
-                  narration_text: str) -> tuple[list[str], list[str]]:
-    """Stage 2: with the plans + thumbnails, pick a clip for each cut.
+def _score_scene_for_plan(analysis: ClipAnalysis, plan: dict) -> float:
+    """Cheap heuristic to rank scenes against a sentence plan before sending to Gemini."""
+    required = [str(r).lower() for r in plan.get("required_elements", [])]
+    forbidden = [str(f).lower() for f in plan.get("forbidden_elements", [])]
+    intent = str(plan.get("visual_intent", "")).lower()
+    phase = str(plan.get("visual_phase", ""))
 
-    Returns (clip_paths_per_cut, reasons_per_cut).
-    """
-    paths_ordered = list(clips_analysis.keys())
+    desc = (analysis.description or "").lower()
+    tags = " ".join(analysis.tags).lower() + " " + desc
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="match_thumbs_"))
-    print(f"  [Stage 2/2] Extracting {len(paths_ordered)} scene thumbnails...")
-    thumbnails: list[bytes] = []
-    for i, scene_id in enumerate(paths_ordered):
-        a = clips_analysis[scene_id]
-        try:
-            thumb = _extract_thumbnail(
-                Path(a.source_file), a.start, a.end, tmp_dir, slug=f"s{i}"
-            )
-            thumbnails.append(thumb.read_bytes())
-        except Exception as e:
-            print(f"    thumbnail failed for {scene_id}: {e}")
-            thumbnails.append(b"")
+    req_hits = sum(1 for r in required if r and r in tags)
+    forb_hits = sum(1 for f in forbidden if f and f in tags)
+    intent_words = [w for w in intent.split() if len(w) > 1]
+    intent_hits = sum(1 for w in intent_words if w in tags)
 
-    plans_by_sent = {p["sentence_index"]: p for p in sentence_plans}
+    suitability_for_phase = analysis.suitability.get(phase, 5) if phase else 5
 
-    enriched_cuts = []
-    for c in cuts:
-        plan = plans_by_sent.get(c.get("owning_sentence_index"))
-        enriched_cuts.append({
-            **c,
-            "visual_intent": (plan or {}).get("visual_intent", ""),
-            "required_elements": (plan or {}).get("required_elements", []),
-            "forbidden_elements": (plan or {}).get("forbidden_elements", []),
-            "contrast_with_previous": (plan or {}).get("contrast_with_previous", ""),
-            "critical": (plan or {}).get("critical", False),
-            "alternates_ok": (plan or {}).get("alternates_ok", True),
-        })
+    return (
+        req_hits * 6.0
+        + intent_hits * 1.5
+        + suitability_for_phase * 0.6
+        + analysis.retention_value * 0.4
+        + analysis.visual_impact * 0.3
+        - forb_hits * 12.0
+    )
 
+
+def _prefilter_for_sentence(plan: dict, clips_analysis: dict[str, ClipAnalysis],
+                             top_k: int = 20) -> list[str]:
+    """Pick the top-k most plausible scenes for this sentence to send to Gemini."""
+    scored = [(_score_scene_for_plan(a, plan), sid) for sid, a in clips_analysis.items()]
+    scored.sort(reverse=True)
+    return [sid for _, sid in scored[:top_k]]
+
+
+def _enforce_reuse_cap(paths: list[str], reasons: list[str],
+                        clips_analysis: dict[str, ClipAnalysis],
+                        plans_by_sent: dict[int, dict],
+                        cuts: list[dict],
+                        max_reuse: int = 2) -> tuple[list[str], list[str]]:
+    """Replace 3rd+ occurrences of any clip with the best unused alternative."""
+    used: dict[str, int] = {}
+    for p in paths:
+        used[p] = used.get(p, 0) + 1
+
+    new_paths = list(paths)
+    new_reasons = list(reasons)
+    for i, p in enumerate(paths):
+        if used[p] <= max_reuse:
+            continue
+        # This is an over-use. Find an alternative.
+        plan = plans_by_sent.get(cuts[i].get("owning_sentence_index"), {})
+        candidates = []
+        for sid, a in clips_analysis.items():
+            if used.get(sid, 0) >= max_reuse:
+                continue
+            if sid in (paths[i - 1] if i > 0 else None,
+                      paths[i + 1] if i + 1 < len(paths) else None):
+                continue
+            candidates.append((_score_scene_for_plan(a, plan), sid))
+        if not candidates:
+            continue
+        candidates.sort(reverse=True)
+        new_sid = candidates[0][1]
+        used[p] -= 1
+        used[new_sid] = used.get(new_sid, 0) + 1
+        new_paths[i] = new_sid
+        new_reasons[i] = f"[reuse-cap] swapped from over-used clip → {Path(new_sid).name}"
+    return new_paths, new_reasons
+
+
+def _assign_clips_for_sentence(client: genai.Client, sentence_idx: int,
+                                sentence_text: str, plan: dict,
+                                cuts_in_sentence: list[dict],
+                                candidate_ids: list[str],
+                                clips_analysis: dict[str, ClipAnalysis],
+                                style: dict, narration_text: str,
+                                tmp_dir: Path) -> dict[int, tuple[str, str, int]]:
+    """Run Stage 2 for ONE sentence. Returns {cut_index: (scene_id, reason, score)}."""
     style_signature = style.get("capcut_automation_hints", {}).get("style_signature", "")
 
-    header = f"""너는 짜집기 쇼츠 편집자다. 1단계에서 디렉터가 짜둔 [시각 계획]을 따라, 2단계로 각 컷에 클립을 배정한다.
+    thumbnails: list[bytes] = []
+    for i, sid in enumerate(candidate_ids):
+        a = clips_analysis[sid]
+        try:
+            thumb = _extract_thumbnail(
+                Path(a.source_file), a.start, a.end, tmp_dir, slug=f"s{sentence_idx}_c{i}"
+            )
+            thumbnails.append(thumb.read_bytes())
+        except Exception:
+            thumbnails.append(b"")
+
+    header = f"""너는 짜집기 쇼츠 편집자다. 한 문장에 속한 컷들에 클립을 배정한다.
+
+[전체 나레이션 — 흐름 파악만]
+{narration_text}
 
 [편집 스타일]
 {style_signature}
 
-[전체 나레이션 — 흐름 파악용]
-{narration_text}
+[지금 배정할 문장]
+"{sentence_text}"
+
+[이 문장의 시각 계획 (1단계 디렉터의 지시)]
+- visual_intent: {plan.get("visual_intent", "")}
+- required_elements: {plan.get("required_elements", [])}
+- forbidden_elements: {plan.get("forbidden_elements", [])}
+- contrast_with_previous: {plan.get("contrast_with_previous", "")}
+- visual_phase: {plan.get("visual_phase", "")}
+- critical: {plan.get("critical", False)}
 
 [키워드 매칭 vs 의미 매칭 — 가장 중요]
-⚠️ "같은 단어가 있다 = 매칭" 아니다. 의미/의도가 같아야 매칭이다.
+⚠️ "단어 같다 = 매칭" 절대 아니다. 의미/의도가 같아야 매칭이다.
 
-나쁜 예 (키워드만 맞춤):
-- "가스 뱉어내야 한다" 문장에 "김치 위에 쌀밥 올리기" 클립 → 둘 다 "김치" 키워드지만 의미 완전 다름, 0점
-- "이모 솔루션(특별한 덮개)" 문장에 "얇은 비닐 랩 덮기" 클립 → 둘 다 "덮다" 키워드지만 직전 문장에서 비닐이 문제라고 했음. **논리 모순**. 0점
-- "맛 차이가 확 난다" 문장에 "양념 푸기" 클립 → "김치" 공통이지만 "맛 = 먹는 행위/완성된 모습"이 필요, 1점
-
-좋은 예 (의미 일치):
-- "꾹 덮어준다" (솔루션) → 손이 단단한 뚜껑/누름판 누르는 클립 (비닐 랩 NO)
-- "곰팡이 생긴다" (문제) → 곰팡이 핀 음식 클로즈업 (깨끗한 김치 NO)
-- "맛이 미쳤다" (결과) → 먹는 장면/신선한 결과물 (조리 과정 NO)
-- "납품 이모" (권위) → 대량/전문 주방 (가정 주방 NO)
+나쁜 예:
+- "솔루션 도구 등장" 문장에 "외국인이 병뚜껑 못 여는 밈" → 둘 다 "병/뚜껑" 키워드지만 의미 완전 다름. 0점
+- "맛 차이" 문장에 "지폐를 지갑에 넣는 영상" → 무관함. 0점
+- "곰팡이 생긴다" 문장에 "신선한 깍두기" → 정반대. 0점
+- "이걸 덮어준다" (솔루션) 문장에 "그냥 비닐 랩" → 직전 문장에서 비닐이 문제라 했음. 논리 모순. 0점
 
 [절대 규칙]
-1. 각 컷의 **visual_intent**를 먼저 읽고, required_elements가 썸네일에 보이는 클립을 골라라.
-2. **forbidden_elements가 보이는 클립은 매칭에서 제외.** 점수 0으로 취급.
-3. **contrast_with_previous** 필드를 반드시 확인 — 앞 문장 대비 달라야 할 점. 이걸 위반하면 논리 붕괴.
-4. **critical=true** 컷은 매칭 강도 9점 이상만 허용. 9점 이상 클립 없으면 가장 가까운 거 + reason에 "타협"이라고 명시.
-5. **첫 컷 (cut 0, hook)**: visual_impact 8 이상 + retention 8 이상 클립만 사용. 충격 없는 클립으로 시작하면 시청자 이탈.
-6. 같은 클립(같은 scene_id)을 한 영상에서 **최대 2번까지만** 사용. 3번째부터는 다른 클립 강제.
-7. 같은 클립을 연속 2컷에 배치 금지. 같은 문장 내에서도 변화 줘라.
-8. retention_value 가 낮은 (1-3) 클립은 가능한 피해라. 시청자 이탈 위험.
-9. 안 쓰인 클립이 있으면 손해. 가능한 골고루.
+1. visual_intent와 required_elements가 썸네일에 보이는 클립을 골라라.
+2. forbidden_elements가 썸네일에 보이면 0점.
+3. critical=true면 9점 이상만 허용. 9점 이상 없으면 가장 가까운 거 + reason에 "타협" 명시.
+4. 같은 클립을 연속 컷에 배치 금지.
+5. 첫 문장(hook)이면 visual_impact + retention 모두 8↑인 클립 우선.
+6. retention 1-3 클립은 가능한 회피.
 
-[컷 목록 — visual_intent에 맞는 클립을 찾아라]
-{json.dumps(enriched_cuts, ensure_ascii=False, indent=2)}
+[배정할 컷 목록]
+{json.dumps(cuts_in_sentence, ensure_ascii=False, indent=2)}
 
-[사용 가능한 클립 — 아래에 썸네일 첨부]
+[후보 클립 목록 — 아래 썸네일 첨부 순서대로]
 """
 
-    for i, scene_id in enumerate(paths_ordered):
-        a = clips_analysis[scene_id]
+    for i, sid in enumerate(candidate_ids):
+        a = clips_analysis[sid]
         retention = getattr(a, "retention_value", a.visual_impact)
         header += (
-            f"\nC{i}: {scene_id}\n"
+            f"\nC{i}: {sid}\n"
             f"  desc: {a.description}\n"
             f"  tags: {a.tags}\n"
             f"  emotion: {a.emotion} / impact: {a.visual_impact}/10 / retention: {retention}/10\n"
@@ -320,46 +375,96 @@ def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[d
 
     footer = """
 
-각 컷에 클립을 배정해 JSON으로만 출력. reason에는 (1) 컷의 visual_intent, (2) 썸네일에 실제로 보이는 시각 요소, (3) 둘이 어떻게 일치하는지 적어.
+각 컷에 클립을 배정해 JSON으로만 출력. reason에는 (1) 컷의 visual_intent (2) 썸네일에 실제로 보이는 시각 요소 (3) 둘이 어떻게 일치하는지 명시.
 
 {"assignments": [
-  {"cut": 0, "clip_id": "C3", "score": 9, "reason": "intent='보관 행위 보여주기' / 썸네일에 비닐 덮인 김치통 보임 / 정확히 일치"},
+  {"cut": <글로벌_cut_index>, "clip_id": "C3", "score": 9, "reason": "..."},
   ...
 ]}
 """
-
     parts: list = [header]
-    for i, (path, thumb_bytes) in enumerate(zip(paths_ordered, thumbnails)):
+    for i, (sid, thumb) in enumerate(zip(candidate_ids, thumbnails)):
         parts.append(f"[C{i} 썸네일:]")
-        if thumb_bytes:
-            parts.append(types.Part.from_bytes(data=thumb_bytes, mime_type="image/jpeg"))
+        if thumb:
+            parts.append(types.Part.from_bytes(data=thumb, mime_type="image/jpeg"))
     parts.append(footer)
 
-    print(f"  Matching {len(cuts)} cuts to {len(paths_ordered)} usable clips...")
-    data = _generate_json_with_retry(client, GEMINI_TEXT_MODEL, parts, label="Stage2")
+    data = _generate_json_with_retry(client, GEMINI_TEXT_MODEL, parts,
+                                      label=f"S2.sent{sentence_idx}")
+    id_to_path = {f"C{i}": candidate_ids[i] for i in range(len(candidate_ids))}
+
+    out: dict[int, tuple[str, str, int]] = {}
+    for a in data.get("assignments", []):
+        try:
+            cut_idx = int(a["cut"])
+            cid = str(a["clip_id"])
+            if cid not in id_to_path:
+                continue
+            out[cut_idx] = (id_to_path[cid], str(a.get("reason", "")), int(a.get("score", 0)))
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out
+
+
+def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[dict],
+                  clips_analysis: dict[str, ClipAnalysis], style: dict,
+                  narration_text: str) -> tuple[list[str], list[str]]:
+    """Stage 2 done per-sentence so each Gemini call sees a focused candidate set."""
+    plans_by_sent = {p["sentence_index"]: p for p in sentence_plans}
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="match_thumbs_"))
+    print(f"  [Stage 2/2] Per-sentence matching ({len(sentence_plans)} sentence(s))...")
+
+    by_cut: dict[int, tuple[str, str, int]] = {}
+    paths_ordered = list(clips_analysis.keys())
+
+    # Group cuts by sentence.
+    cuts_by_sent: dict[int, list[dict]] = {}
+    for c in cuts:
+        sidx = c.get("owning_sentence_index")
+        cuts_by_sent.setdefault(sidx, []).append(c)
+
+    for sidx, cuts_in_sent in cuts_by_sent.items():
+        plan = plans_by_sent.get(sidx, {})
+        sentence_text = next(
+            (p.get("text", "") for p in sentence_plans if p["sentence_index"] == sidx), ""
+        )
+        candidates = _prefilter_for_sentence(plan, clips_analysis, top_k=20)
+        print(f"    sentence {sidx}: {len(cuts_in_sent)} cut(s) ← {len(candidates)} candidates")
+        try:
+            assignments = _assign_clips_for_sentence(
+                client, sidx, sentence_text, plan, cuts_in_sent,
+                candidates, clips_analysis, style, narration_text, tmp_dir,
+            )
+        except Exception as e:
+            print(f"    sentence {sidx} FAILED: {e}")
+            assignments = {}
+        by_cut.update(assignments)
 
     for f in tmp_dir.glob("*"):
         f.unlink(missing_ok=True)
-    tmp_dir.rmdir()
-    id_to_path = {f"C{i}": paths_ordered[i] for i in range(len(paths_ordered))}
-
-    assignments = data.get("assignments", [])
-    by_cut: dict[int, tuple[str, str, int]] = {}
-    for a in assignments:
-        by_cut[int(a["cut"])] = (str(a["clip_id"]), str(a.get("reason", "")), int(a.get("score", 0)))
+    try:
+        tmp_dir.rmdir()
+    except OSError:
+        pass
 
     result_paths: list[str] = []
     result_reasons: list[str] = []
     for i in range(len(cuts)):
         entry = by_cut.get(i)
-        if entry is None or entry[0] not in id_to_path:
-            cid = f"C{i % len(paths_ordered)}"
-            result_paths.append(id_to_path[cid])
+        if entry is None:
+            cid = paths_ordered[i % len(paths_ordered)]
+            result_paths.append(cid)
             result_reasons.append("(fallback: matcher skipped this cut)")
         else:
-            cid, reason, score = entry
-            result_paths.append(id_to_path[cid])
+            sid, reason, score = entry
+            result_paths.append(sid)
             result_reasons.append(f"[score={score}] {reason}")
+
+    # Hard reuse cap as a safety net for when Gemini ignores the rule.
+    result_paths, result_reasons = _enforce_reuse_cap(
+        result_paths, result_reasons, clips_analysis, plans_by_sent, cuts, max_reuse=2,
+    )
     return result_paths, result_reasons
 
 
