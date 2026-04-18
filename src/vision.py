@@ -1,18 +1,20 @@
-"""Scene content analyzer using Gemini Vision.
+"""Scene content analyzer using Gemini Vision (video input).
 
-Each Clip is a sub-scene of a source file (path + start + end). We pull a few
-frames from inside that scene, send them to Gemini, and cache the returned
-description + retention scoring. With scene-level granularity, a 9-minute
-source produces many candidates instead of one.
+Each Clip is a sub-scene of a source file (path + start + end). We cut a small
+compressed video clip for the scene's range and send it to Gemini directly so
+the model sees motion/timing, not just three still frames. Scenes are analyzed
+in parallel to keep wall-clock time low.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -22,6 +24,11 @@ from google.genai import types
 
 from .config import GEMINI_API_KEY, GEMINI_VISION_MODEL
 from .plan import Clip
+
+
+# Concurrency for vision analysis. Free tier is ~15 RPM so default 5 leaves
+# headroom; the retry wrapper handles 429s anyway.
+ANALYSIS_CONCURRENCY = int(os.environ.get("VISION_CONCURRENCY", "5"))
 
 
 @dataclass
@@ -41,9 +48,11 @@ class ClipAnalysis:
     skip_reason: str = ""
 
 
-ANALYSIS_PROMPT = """이 영상 씬(scene)의 프레임 여러 장을 보고 JSON으로만 답해줘. 한국어로.
+ANALYSIS_PROMPT = """이 영상 씬(scene)을 보고 JSON으로만 답해줘. 한국어로.
 
 너는 짜집기 쇼츠 편집자가 인서트로 쓸지 말지 판단하는 중이다. 시청자가 이 화면을 보고 다음 컷까지 멈추지 않을지가 핵심.
+
+영상의 동작/변화/속도/감정까지 모두 관찰해서 답해라 (정지화면이 아니라 실제 움직이는 영상이다).
 
 **1단계: usable 판정 — 매우 보수적**
 기본값 usable=true. 다음일 때만 false:
@@ -64,11 +73,13 @@ usable=true 유지:
 - 4-6: 정보는 있지만 정적 (배경, 풀샷, 평범한 일상)
 - 1-3: 지루함, 의미 모호, 시청자가 떠날 위험
 
+description에는 동작도 적어라 ("여자가 손을 꾹꾹 눌러 김치를 통에 담는다", "양념이 점점 진해지면서 휘저어진다" 같이).
+
 {
   "usable": true 또는 false,
   "clip_type": "content | outro | intro | logo | watermark | transition_only | thumbnail | other",
   "skip_reason": "usable=false인 경우만 짧게 사유. true면 빈 문자열",
-  "description": "이 씬에서 실제로 보이는 것 2-3문장. 인물(성별/행동), 등장 사물, 배경, 분위기 포함",
+  "description": "이 씬에서 일어나는 동작/사건 2-3문장. 인물(성별/행동), 등장 사물, 변화, 분위기 포함",
   "tags": ["구체적 키워드 5-8개 — 사물명/행동/상태"],
   "visual_impact": 1-10 (시각 자극도),
   "retention_value": 1-10 (시청자가 멈추고 보게 되는 정도),
@@ -84,22 +95,28 @@ usable=true 유지:
 다른 설명 없이 JSON만 출력."""
 
 
-def _extract_scene_frames(clip: Clip, count: int = 3) -> list[Path]:
-    """Pull `count` evenly-spaced frames from inside the scene's time range."""
-    tmp_dir = Path(tempfile.mkdtemp(prefix="sceneframes_"))
-    frames: list[Path] = []
+def _extract_scene_clip(clip: Clip) -> Path:
+    """Cut a compressed mp4 of the scene (no audio, 480p, 15fps) for inline upload."""
+    tmp = Path(tempfile.mkdtemp(prefix="sceneclip_"))
+    out = tmp / f"{clip.path.stem}_{clip.start:.1f}_{clip.end:.1f}.mp4"
     duration = max(0.5, clip.duration)
-    for i in range(count):
-        offset = duration * (i + 1) / (count + 1)
-        t = clip.start + offset
-        out = tmp_dir / f"frame_{i}.jpg"
-        subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.2f}",
-             "-i", str(clip.path), "-frames:v", "1", "-q:v", "4", str(out)],
-            check=True,
-        )
-        frames.append(out)
-    return frames
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-ss", f"{clip.start:.2f}",
+            "-i", str(clip.path),
+            "-t", f"{duration:.2f}",
+            "-vf", "scale='min(480,iw)':-2,fps=15",
+            "-an",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "30",
+            "-movflags", "+faststart",
+            str(out),
+        ],
+        check=True,
+    )
+    return out
 
 
 def _clip_signature(clip_path: Path) -> str:
@@ -140,14 +157,22 @@ def _generate_with_retry(client: genai.Client, model: str, contents, max_attempt
 
 
 def analyze_scene(clip: Clip, client: genai.Client) -> ClipAnalysis:
-    frames = _extract_scene_frames(clip, count=3)
-    parts: list = [ANALYSIS_PROMPT]
-    for f in frames:
-        parts.append(types.Part.from_bytes(data=f.read_bytes(), mime_type="image/jpeg"))
-    resp = _generate_with_retry(client, GEMINI_VISION_MODEL, parts)
-    data = _parse_json(resp.text)
-    for f in frames:
-        f.unlink(missing_ok=True)
+    """Send the scene as a real video clip so Gemini sees motion + change."""
+    video_path = _extract_scene_clip(clip)
+    try:
+        video_bytes = video_path.read_bytes()
+        parts: list = [
+            ANALYSIS_PROMPT,
+            types.Part.from_bytes(data=video_bytes, mime_type="video/mp4"),
+        ]
+        resp = _generate_with_retry(client, GEMINI_VISION_MODEL, parts)
+        data = _parse_json(resp.text)
+    finally:
+        try:
+            video_path.unlink(missing_ok=True)
+            video_path.parent.rmdir()
+        except OSError:
+            pass
     return ClipAnalysis(
         path=clip.id,
         source_file=str(clip.path),
@@ -166,7 +191,7 @@ def analyze_scene(clip: Clip, client: genai.Client) -> ClipAnalysis:
 
 
 def build_clips_index(clips: list[Clip], cache_path: Path) -> dict[str, ClipAnalysis]:
-    """Analyze each scene. Cached by source file signature + scene range."""
+    """Analyze each scene in parallel via video input. Cached by file sig + range."""
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set. Create .env with GEMINI_API_KEY=... or skip semantic matching.")
     client = genai.Client(api_key=GEMINI_API_KEY)
@@ -178,7 +203,7 @@ def build_clips_index(clips: list[Clip], cache_path: Path) -> dict[str, ClipAnal
             cache = {}
 
     result: dict[str, ClipAnalysis] = {}
-    prompt_version = "v5"
+    prompt_version = "v6_video"
 
     # Group scenes by file so we only signature-hash each file once.
     sigs: dict[Path, str] = {}
@@ -186,17 +211,43 @@ def build_clips_index(clips: list[Clip], cache_path: Path) -> dict[str, ClipAnal
         if c.path not in sigs:
             sigs[c.path] = _clip_signature(c.path)
 
-    for i, clip in enumerate(clips):
+    pending: list[tuple[Clip, str]] = []
+    for clip in clips:
         sig = sigs[clip.path]
         key = f"{prompt_version}:{clip.path.name}:{sig[:12]}:{clip.start:.2f}-{clip.end:.2f}"
         if key in cache:
             result[clip.id] = ClipAnalysis(**cache[key])
             continue
-        print(f"  [{i + 1}/{len(clips)}] Analyzing {clip.path.name} {clip.start:.1f}-{clip.end:.1f}s...")
-        analysis = analyze_scene(clip, client)
-        result[clip.id] = analysis
-        cache[key] = asdict(analysis)
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        pending.append((clip, key))
+
+    if not pending:
+        return result
+
+    total = len(pending)
+    done = 0
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def task(clip: Clip, key: str) -> tuple[str, ClipAnalysis, str]:
+        return key, analyze_scene(clip, client), clip.id
+
+    print(f"  Analyzing {total} new scene(s) with {ANALYSIS_CONCURRENCY} parallel workers (video input)...")
+    with ThreadPoolExecutor(max_workers=ANALYSIS_CONCURRENCY) as pool:
+        futures = {pool.submit(task, clip, key): (clip, key) for clip, key in pending}
+        for fut in as_completed(futures):
+            clip, key = futures[fut]
+            try:
+                cache_key, analysis, clip_id = fut.result()
+            except Exception as e:
+                done += 1
+                print(f"    [{done}/{total}] FAILED {clip.id}: {e}")
+                continue
+            result[clip_id] = analysis
+            cache[cache_key] = asdict(analysis)
+            done += 1
+            print(f"    [{done}/{total}] {clip.path.name} {clip.start:.1f}-{clip.end:.1f}s done")
+            # Persist after each success so a crash doesn't lose work.
+            cache_path.write_text(
+                json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
 
     return result
