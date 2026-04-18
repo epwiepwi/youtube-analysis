@@ -111,21 +111,33 @@ def compute_cut_points(transcript: Transcript, style: dict) -> list[float]:
 
 
 def assign_clips_to_cuts(cut_points: list[float], clips: list[Clip]) -> list[VideoSegment]:
+    """Rotate through clips so each cut shows a different clip (짜집기 style).
+
+    Picks a different clip for every cut. Within each clip, takes a slice from
+    a rotating offset so revisits to the same clip don't show identical frames.
+    """
     segments: list[VideoSegment] = []
-    clip_cursor = 0
-    clip_offset = 0.0
+    n = len(clips)
+    revisit_count: dict[int, int] = {i: 0 for i in range(n)}
+
     for idx in range(len(cut_points) - 1):
         t_start = cut_points[idx]
         t_end = cut_points[idx + 1]
         needed = t_end - t_start
-        clip = clips[clip_cursor % len(clips)]
-        available = clip.duration - clip_offset
-        if available < needed:
-            clip_cursor += 1
-            clip_offset = 0.0
-            clip = clips[clip_cursor % len(clips)]
-        src_start = clip_offset
-        src_end = clip_offset + needed
+        clip_idx = idx % n
+        clip = clips[clip_idx]
+        revisit = revisit_count[clip_idx]
+        revisit_count[clip_idx] += 1
+
+        if clip.duration <= needed:
+            src_start = 0.0
+            src_end = clip.duration
+        else:
+            slack = clip.duration - needed
+            step = slack / max(1, (n if revisit > 0 else 2))
+            src_start = min(slack, revisit * step + slack * 0.1)
+            src_end = src_start + needed
+
         segments.append(
             VideoSegment(
                 clip=clip,
@@ -135,10 +147,6 @@ def assign_clips_to_cuts(cut_points: list[float], clips: list[Clip]) -> list[Vid
                 timeline_end=round(t_end, 3),
             )
         )
-        clip_offset += needed
-        if clip_offset >= clip.duration - 0.1:
-            clip_cursor += 1
-            clip_offset = 0.0
     return segments
 
 
