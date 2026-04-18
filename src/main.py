@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Callable
 
 from .capcut_draft import copy_assets, write_draft
 from .config import PATHS
@@ -10,8 +11,15 @@ from .plan import build_plan, save_plan
 from .transcribe import save_transcript, transcribe
 
 
+ProgressFn = Callable[[str, float], None]  # (message, fraction 0..1)
+
+
 def load_style(profile_path: Path) -> dict:
     return json.loads(profile_path.read_text(encoding="utf-8"))
+
+
+def _default_progress(msg: str, frac: float) -> None:
+    print(msg)
 
 
 def run(
@@ -24,15 +32,17 @@ def run(
     use_semantic: bool = False,
     reference_video: Path | None = None,
     use_selections: bool = False,
+    progress: ProgressFn | None = None,
 ) -> Path:
+    cb = progress or _default_progress
     style = load_style(profile_path)
 
-    print("[1/4] Transcribing narration...")
+    cb("[1/4] Transcribing narration...", 0.05)
     transcript = transcribe(narration, language="ko")
     save_transcript(transcript, output_dir / "transcript.json")
-    print(f"  -> {len(transcript.words)} words, {transcript.duration:.2f}s")
+    cb(f"  -> {len(transcript.words)} words, {transcript.duration:.2f}s", 0.20)
 
-    print("[2/4] Building edit plan...")
+    cb("[2/4] Building edit plan...", 0.25)
     plan = build_plan(
         narration, transcript, clips_dir, style,
         use_semantic=use_semantic, output_dir=output_dir,
@@ -40,16 +50,16 @@ def run(
         use_selections=use_selections,
     )
     save_plan(plan, output_dir / "plan.json")
-    print(f"  -> {len(plan.video_segments)} cuts, {len(plan.captions)} captions")
+    cb(f"  -> {len(plan.video_segments)} cuts, {len(plan.captions)} captions", 0.80)
 
-    print("[3/4] Writing CapCut draft...")
+    cb("[3/4] Writing CapCut draft...", 0.85)
     project_dir = write_draft(project_name, plan, draft_root)
     plan = copy_assets(plan, project_dir)
     # Rewrite draft with the copied asset paths.
     write_draft(project_name, plan, draft_root)
-    print(f"  -> {project_dir}")
+    cb(f"  -> {project_dir}", 0.95)
 
-    print("[4/4] Done. Open CapCut and find the project in your draft list.")
+    cb("[4/4] Done. Open CapCut and find the project in your draft list.", 1.0)
     return project_dir
 
 

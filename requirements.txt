@@ -3,3 +3,5 @@ pydub>=0.25.1
 ffmpeg-python>=0.2.0
 google-genai>=0.3.0
 python-dotenv>=1.0.0
+PyQt6>=6.6.0
+PyQt6-WebEngine>=6.6.0
