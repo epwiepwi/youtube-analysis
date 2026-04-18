@@ -86,11 +86,13 @@ def load_files(clip_dir: Path) -> list[tuple[Path, float]]:
 
 def detect_scenes(file_path: Path, file_duration: float,
                   threshold: float = 0.3, min_scene_sec: float = 1.5,
+                  max_scene_sec: float = 8.0,
                   max_scenes: int = 25) -> list[Clip]:
     """Use ffmpeg's scene filter to split a source file into candidate scenes.
 
-    Falls back to uniform sampling (every ~6s) if scene detection finds nothing.
-    Caps scenes per file to avoid blowing up the analysis budget.
+    Long scenes (continuous takes) are sub-divided into chunks of at most
+    `max_scene_sec` so each candidate is short enough for a fast video upload
+    and so a 6-minute continuous shot doesn't become a single useless scene.
     """
     cmd = [
         "ffmpeg", "-hide_banner", "-i", str(file_path),
@@ -113,13 +115,20 @@ def detect_scenes(file_path: Path, file_duration: float,
     boundaries = [0.0] + sorted(set(cut_times)) + [file_duration]
     scenes: list[Clip] = []
     for a, b in zip(boundaries, boundaries[1:]):
-        if b - a >= min_scene_sec:
-            scenes.append(Clip(path=file_path, start=round(a, 2),
-                               end=round(b, 2), file_duration=file_duration))
+        if b - a < min_scene_sec:
+            continue
+        # Sub-divide long takes into max_scene_sec chunks.
+        sub = a
+        while sub < b:
+            sub_end = min(sub + max_scene_sec, b)
+            if sub_end - sub >= min_scene_sec:
+                scenes.append(Clip(path=file_path, start=round(sub, 2),
+                                   end=round(sub_end, 2),
+                                   file_duration=file_duration))
+            sub = sub_end
 
     if not scenes:
-        # Uniform fallback so even a continuous take produces multiple candidates.
-        step = max(min_scene_sec, file_duration / 8)
+        step = max(min_scene_sec, min(max_scene_sec, file_duration / 8))
         t = 0.0
         while t + min_scene_sec <= file_duration and len(scenes) < max_scenes:
             scenes.append(Clip(path=file_path, start=round(t, 2),
@@ -128,7 +137,6 @@ def detect_scenes(file_path: Path, file_duration: float,
             t += step
 
     if len(scenes) > max_scenes:
-        # Keep evenly-spaced scenes so we still cover the whole file.
         stride = len(scenes) / max_scenes
         scenes = [scenes[int(i * stride)] for i in range(max_scenes)]
 

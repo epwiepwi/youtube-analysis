@@ -156,6 +156,13 @@ def _generate_with_retry(client: genai.Client, model: str, contents, max_attempt
             raise
 
 
+def _safe_int(value, default: int = 5) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def analyze_scene(clip: Clip, client: genai.Client) -> ClipAnalysis:
     """Send the scene as a real video clip so Gemini sees motion + change."""
     video_path = _extract_scene_clip(clip)
@@ -178,15 +185,15 @@ def analyze_scene(clip: Clip, client: genai.Client) -> ClipAnalysis:
         source_file=str(clip.path),
         start=clip.start,
         end=clip.end,
-        description=str(data.get("description", "")),
-        tags=[str(t) for t in data.get("tags", [])],
-        visual_impact=int(data.get("visual_impact", 5)),
-        retention_value=int(data.get("retention_value", 5)),
-        emotion=str(data.get("emotion", "neutral")),
-        suitability={k: int(v) for k, v in (data.get("suitability") or {}).items()},
-        usable=bool(data.get("usable", True)),
-        clip_type=str(data.get("clip_type", "content")),
-        skip_reason=str(data.get("skip_reason", "")),
+        description=str(data.get("description") or ""),
+        tags=[str(t) for t in (data.get("tags") or [])],
+        visual_impact=_safe_int(data.get("visual_impact"), 5),
+        retention_value=_safe_int(data.get("retention_value"), 5),
+        emotion=str(data.get("emotion") or "neutral"),
+        suitability={k: _safe_int(v, 0) for k, v in (data.get("suitability") or {}).items()},
+        usable=bool(data.get("usable", True)) if data.get("usable") is not None else True,
+        clip_type=str(data.get("clip_type") or "content"),
+        skip_reason=str(data.get("skip_reason") or ""),
     )
 
 
