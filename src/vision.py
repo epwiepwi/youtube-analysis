@@ -30,21 +30,36 @@ class ClipAnalysis:
     visual_impact: int = 5
     emotion: str = "neutral"
     suitability: dict[str, int] = field(default_factory=dict)
+    usable: bool = True
+    clip_type: str = "content"
+    skip_reason: str = ""
 
 
 ANALYSIS_PROMPT = """이 영상 클립의 프레임 여러 장을 보고 JSON으로만 답해줘. 한국어로 작성.
-중요: "무엇이 실제로 화면에 보이는지"를 구체적으로 써줘 (사람 있음/없음, 사물, 색감, 상황).
+
+**1단계: 이 클립이 실제 콘텐츠인지 판단**
+다음 중 하나면 usable=false:
+- 크리에이터 로고/프로필 사진만 있음 (아웃트로/인트로)
+- "구독해주세요" 같은 텍스트만 있고 콘텐츠 없음
+- 워터마크/채널 마크가 화면을 거의 덮음
+- 검은 화면/색만 있는 전환구간
+- 썸네일 화면 (정지된 그림 한 장)
+
+**2단계: 콘텐츠 클립인 경우만 채워**
 
 {
-  "description": "이 클립에서 실제로 보이는 것 2-3문장. 인물(성별/행동), 등장 사물, 배경, 분위기 포함",
-  "tags": ["구체적 키워드 5-8개 — 사물명, 행동, 상태 등. 예: '양파', '곰팡이', '주방', '썰기'"],
-  "visual_impact": 1-10 (시각적 충격/자극도, 10이 가장 강렬),
-  "emotion": "shock | warning | calm | clean | disgusting | action | mundane 중 하나",
+  "usable": true 또는 false,
+  "clip_type": "content | outro | intro | logo | watermark | transition_only | thumbnail | other",
+  "skip_reason": "usable=false인 경우만 짧게 사유. true면 빈 문자열",
+  "description": "이 클립에서 실제로 보이는 것 2-3문장. 인물(성별/행동), 등장 사물, 배경, 분위기 포함. usable=false면 짧게.",
+  "tags": ["구체적 키워드 5-8개 — 사물명, 행동, 상태. 예: '양파', '곰팡이', '주방', '썰기'. usable=false면 빈 배열"],
+  "visual_impact": 1-10 (시각적 충격/자극도, usable=false면 0),
+  "emotion": "shock | warning | calm | clean | disgusting | action | mundane 중 하나, usable=false면 'none'",
   "suitability": {
-    "hook": 0-10 (영상 맨 앞 2초 훅으로 쓸만한지),
-    "problem": 0-10 (문제/경고 장면에 쓸만한지),
-    "solution": 0-10 (해결책/결과 장면에 쓸만한지),
-    "cta": 0-10 (마무리/CTA에 쓸만한지)
+    "hook": 0-10 (영상 맨 앞 2초 훅),
+    "problem": 0-10 (문제/경고 장면),
+    "solution": 0-10 (해결책/결과 장면),
+    "cta": 0-10 (마무리/CTA)
   }
 }
 
@@ -126,6 +141,9 @@ def analyze_clip(clip_path: Path, client: genai.Client) -> ClipAnalysis:
         visual_impact=int(data.get("visual_impact", 5)),
         emotion=str(data.get("emotion", "neutral")),
         suitability={k: int(v) for k, v in (data.get("suitability") or {}).items()},
+        usable=bool(data.get("usable", True)),
+        clip_type=str(data.get("clip_type", "content")),
+        skip_reason=str(data.get("skip_reason", "")),
     )
 
 
@@ -142,7 +160,7 @@ def build_clips_index(clip_paths: list[Path], cache_path: Path) -> dict[str, Cli
 
     result: dict[str, ClipAnalysis] = {}
     dirty = False
-    prompt_version = "v2"
+    prompt_version = "v3"
     for cp in clip_paths:
         sig = _clip_signature(cp)
         key = f"{prompt_version}:{cp.name}:{sig[:12]}"

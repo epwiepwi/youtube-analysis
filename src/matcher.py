@@ -1,7 +1,13 @@
-"""Semantic matcher: decide which clip to show at each cut.
+"""Two-stage semantic matcher.
 
-Gives Gemini the actual clip thumbnails plus the full narration so it matches
-on what the footage looks like, not just the text description of it.
+Stage 1: per-sentence visual planning (text-only Gemini call). For every
+sentence in the narration, decide what the viewer should SEE: required
+elements, forbidden contradictions, and whether it is a critical moment
+(solution reveal, CTA hook).
+
+Stage 2: per-cut clip assignment (vision Gemini call). Given the plan and
+the actual clip thumbnails, assign one usable clip per cut. Junk clips
+(outro/logo) are filtered out before this stage.
 """
 
 from __future__ import annotations
@@ -57,10 +63,6 @@ def _tag_cuts_with_captions(cuts: list[tuple[float, float]], captions: list[dict
 
 
 def _split_sentences(words: list[dict]) -> list[dict]:
-    """Group words into sentence-like units based on gaps between word ends and next starts.
-    words: list of {"start": float, "end": float, "text": str}
-    Returns list of {"start": float, "end": float, "text": str}
-    """
     if not words:
         return []
     sentences: list[dict] = []
@@ -84,30 +86,6 @@ def _split_sentences(words: list[dict]) -> list[dict]:
             "text": " ".join(w["text"] for w in bucket).strip(),
         })
     return sentences
-
-
-def _context_for_cut(cut_start: float, cut_end: float, words: list[dict],
-                      sentences: list[dict], window: int = 8) -> dict:
-    """Build rich context: words spoken in this cut, window before/after, owning sentence."""
-    spoken = [w for w in words if cut_start <= w["start"] < cut_end]
-    if not spoken:
-        nearest = min(words, key=lambda w: abs(w["start"] - cut_start))
-        idx = words.index(nearest)
-    else:
-        idx = words.index(spoken[0])
-    last_idx = words.index(spoken[-1]) if spoken else idx
-    before = words[max(0, idx - window):idx]
-    after = words[last_idx + 1:last_idx + 1 + window]
-    owning = next(
-        (s for s in sentences if s["start"] <= (cut_start + cut_end) / 2 <= s["end"]),
-        None,
-    )
-    return {
-        "spoken_here": " ".join(w["text"] for w in spoken) or "(silence)",
-        "context_before": " ".join(w["text"] for w in before),
-        "context_after": " ".join(w["text"] for w in after),
-        "full_sentence": owning["text"] if owning else "",
-    }
 
 
 def _classify_phase(cut_index: int, total_cuts: int, t_start: float, hook_end: float,
@@ -144,49 +122,58 @@ def _extract_thumbnail(clip_path: Path, tmp_dir: Path) -> Path:
     return out
 
 
-def match_clips(
-    cuts: list[tuple[float, float]],
-    captions: list[dict],
-    clips_analysis: dict[str, ClipAnalysis],
-    style: dict,
-    total_duration: float,
-    narration_text: str = "",
-    words: list[dict] | None = None,
-) -> list[str]:
-    """Return a list of clip paths, one per cut, in cut order.
+def _plan_sentences(client: genai.Client, sentences: list[dict], narration_text: str,
+                    style: dict) -> list[dict]:
+    """Stage 1: ask Gemini what each sentence needs to show visually."""
+    style_signature = style.get("capcut_automation_hints", {}).get("style_signature", "")
+    content_template = style.get("content_structure", {}).get("template", "")
 
-    Matching is sentence-anchored: each cut carries its owning sentence plus
-    a short word window before/after. The prompt tells Gemini to pick based
-    on that sentence's meaning, not on the 1-2 word display caption.
+    prompt = f"""너는 짜집기 쇼츠 편집 디렉터다. 나레이션 문장 하나하나에 대해, "이 순간 시청자가 무엇을 봐야 하는지"를 미리 계획한다.
+
+[전체 나레이션]
+{narration_text}
+
+[편집 스타일]
+{style_signature}
+
+[내러티브 템플릿]
+{content_template}
+
+[작업 — 아래 문장 각각에 대해 시각 계획을 세워라]
+{json.dumps(sentences, ensure_ascii=False, indent=2)}
+
+[출력 규칙]
+각 문장마다:
+- visual_intent: 이 순간 화면이 시청자에게 전달해야 할 메시지 (예: "잘못된 보관 방법을 보여줘서 공감 유발")
+- required_elements: 화면에 반드시 보여야 하는 구체 요소 (예: ["비닐", "김치통", "덮는 동작"])
+- forbidden_elements: 화면에 절대 나오면 안 되는 요소 (예: ["깨끗한 결과물", "먹는 장면"])
+- visual_phase: hook | problem | solution | cta | bridge
+- critical: true/false (이 문장이 영상의 결정적 순간인가? — hook 첫 문장, 솔루션 등장, CTA는 critical=true)
+- alternates_ok: true/false (꼭 정확한 매칭 아니어도 분위기만 맞으면 OK인 문장인가)
+
+JSON만 출력:
+{{"plans": [
+  {{"sentence_index": 0, "visual_intent": "...", "required_elements": [...], "forbidden_elements": [...], "visual_phase": "hook", "critical": true, "alternates_ok": false}},
+  ...
+]}}
+"""
+    print(f"  [Stage 1/2] Planning visuals for {len(sentences)} sentences...")
+    resp = _generate_with_retry(client, GEMINI_TEXT_MODEL, prompt)
+    data = _parse_json(resp.text)
+    return data.get("plans", [])
+
+
+def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[dict],
+                  clips_analysis: dict[str, ClipAnalysis], style: dict,
+                  narration_text: str) -> tuple[list[str], list[str]]:
+    """Stage 2: with the plans + thumbnails, pick a clip for each cut.
+
+    Returns (clip_paths_per_cut, reasons_per_cut).
     """
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY not set.")
-    client = genai.Client(api_key=GEMINI_API_KEY)
-
-    hook_end = float(style.get("hook", {}).get("opening_duration_sec", 2.0))
-    ending_duration = float(style.get("ending", {}).get("duration_sec", 3.0))
-
-    words = words or []
-    sentences = _split_sentences(words)
-
-    cut_entries = []
-    for i, (t_start, t_end) in enumerate(cuts):
-        phase = _classify_phase(i, len(cuts), t_start, hook_end, ending_duration, total_duration)
-        ctx = _context_for_cut(t_start, t_end, words, sentences)
-        cut_entries.append({
-            "index": i,
-            "time": f"{t_start:.2f}-{t_end:.2f}s",
-            "phase": phase,
-            "spoken_here": ctx["spoken_here"],
-            "full_sentence": ctx["full_sentence"],
-            "context_before": ctx["context_before"],
-            "context_after": ctx["context_after"],
-        })
-
     paths_ordered = list(clips_analysis.keys())
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="match_thumbs_"))
-    print(f"  Extracting thumbnails for {len(paths_ordered)} clips...")
+    print(f"  [Stage 2/2] Extracting {len(paths_ordered)} thumbnails...")
     thumbnails: list[bytes] = []
     for p in paths_ordered:
         try:
@@ -196,60 +183,65 @@ def match_clips(
             print(f"    thumbnail failed for {Path(p).name}: {e}")
             thumbnails.append(b"")
 
+    plans_by_sent = {p["sentence_index"]: p for p in sentence_plans}
+
+    enriched_cuts = []
+    for c in cuts:
+        plan = plans_by_sent.get(c.get("owning_sentence_index"))
+        enriched_cuts.append({
+            **c,
+            "visual_intent": (plan or {}).get("visual_intent", ""),
+            "required_elements": (plan or {}).get("required_elements", []),
+            "forbidden_elements": (plan or {}).get("forbidden_elements", []),
+            "critical": (plan or {}).get("critical", False),
+            "alternates_ok": (plan or {}).get("alternates_ok", True),
+        })
+
     style_signature = style.get("capcut_automation_hints", {}).get("style_signature", "")
-    content_template = style.get("content_structure", {}).get("template", "")
-    hook_tactics = "; ".join(style.get("hook", {}).get("retention_tactics", []))
 
-    sentences_json = json.dumps(
-        [{"start": round(s["start"], 2), "end": round(s["end"], 2), "text": s["text"]}
-         for s in sentences],
-        ensure_ascii=False, indent=2,
-    )
+    header = f"""너는 짜집기 쇼츠 편집자다. 1단계에서 디렉터가 짜둔 [시각 계획]을 따라, 2단계로 각 컷에 클립을 배정한다.
 
-    header = f"""너는 최고 수준의 짜집기 쇼츠 편집자다. 전체 스토리는 참고만 하고, **각 컷의 "full_sentence"가 말하는 내용에 어울리는 클립**을 고른다.
-
-[전체 스토리 (참고용, 큰 흐름 파악만)]
-{narration_text}
-
-[문장 단위 분해 (이것이 진짜 매칭 기준)]
-{sentences_json}
-
-[편집 스타일 시그니처]
+[편집 스타일]
 {style_signature}
 
-[내러티브 템플릿]
-{content_template}
+[전체 나레이션 — 흐름 파악용]
+{narration_text}
 
-[훅 전략]
-{hook_tactics}
+[금지 매칭 예시 — 절대 하지 마라]
+- "보관/덮는다" 문장에 "씻는다/썬다" 클립 → 동작이 다름, 0점
+- "깔끔한 결과" 문장에 "썩은/곰팡이" 클립 → 의미 정반대, 0점
+- "먹다/맛" 문장에 "재료 손질" 클립 → 단계가 다름, 1점
+- "솔루션 도구 등장" 문장(critical=true)에 도구 안 보이는 클립 → 핵심 실패, 1점
+- 어떤 문장에도 outro/로고/워터마크 클립 → 의미 무관, 0점
 
-[절대 규칙 — 순서대로 적용]
-1. **매칭 기준은 컷의 "full_sentence"이다.** 그 문장이 무엇을 말하는지 파악하고, 그 의미에 맞는 클립을 골라라. "spoken_here" 1-2어절만 보고 결정하지 마라.
-2. 문장이 말하는 **명사/동사/상태가 실제로 썸네일에 보이는지** 확인. 예: 문장이 "양파 껍질 벗기면 곰팡이가 있다"면 곰팡이/껍질/양파가 보이는 클립.
-3. **같은 문장 내 여러 컷**은 같은 주제를 다루므로, 변화를 주되 그 문장 주제를 벗어나지 마라 (다양한 각도/상세컷 느낌).
-4. phase=hook(맨 앞 {hook_end}s)은 visual_impact 8+이고 즉각 시선을 끄는 클립.
-5. phase=problem은 부정/경고/지저분한 장면. phase=solution은 깔끔/정돈/만족감 장면.
-6. **문장 의미와 정반대 클립 절대 금지.** "신세계다" 문장에 썩은 양파 같은 건 0점.
-7. 연속 컷에 같은 클립 쓰지 마라 (최소 2컷 간격).
-8. 안 쓰인 클립이 있으면 낭비다. 가능한 골고루 써라.
+[좋은 매칭 예시]
+- "꾹 덮어준다" 문장 → 손이 뚜껑을 누르는 클립
+- "곰팡이 생긴다" 문장 → 부패한 음식 클로즈업
+- "맛이 미쳤다" 문장 → 김치+밥 먹방 클로즈업
 
-[컷 목록 — 각 컷의 full_sentence를 핵심 기준으로 사용]
-{json.dumps(cut_entries, ensure_ascii=False, indent=2)}
+[절대 규칙]
+1. 각 컷의 visual_intent를 먼저 읽고, required_elements가 썸네일에 보이는 클립을 골라라.
+2. forbidden_elements가 보이는 클립은 점수 0으로 취급.
+3. critical=true 컷은 매칭 강도 9점 이상만 허용. 9점 이상 클립 없으면 가장 가까운 거 + reason에 "타협"이라고 명시.
+4. 같은 클립을 연속 2컷에 배치 금지. 같은 문장 내에서도 변화 줘라.
+5. 안 쓰인 클립이 있으면 손해. 가능한 골고루.
 
-[사용 가능한 클립 — 아래에 각 클립의 썸네일 이미지가 순서대로 첨부됨]
+[컷 목록 — visual_intent에 맞는 클립을 찾아라]
+{json.dumps(enriched_cuts, ensure_ascii=False, indent=2)}
+
+[사용 가능한 클립 — 아래에 썸네일 첨부]
 """
 
     for i, path in enumerate(paths_ordered):
         a = clips_analysis[path]
-        header += f"\nC{i}: {Path(path).name}\n  desc: {a.description}\n  tags: {a.tags}\n  impact: {a.visual_impact}/10 / emotion: {a.emotion} / suitability: {a.suitability}\n"
+        header += f"\nC{i}: {Path(path).name}\n  desc: {a.description}\n  tags: {a.tags}\n  emotion: {a.emotion} / impact: {a.visual_impact}/10\n"
 
     footer = """
 
-위 모든 썸네일을 본 뒤, 각 컷의 full_sentence 의미에 가장 어울리는 클립을 JSON으로만 출력해.
-reason에는 반드시: (1) 해당 문장이 말하는 것, (2) 썸네일에 실제로 보이는 시각 요소, (3) 왜 둘이 맞는지.
+각 컷에 클립을 배정해 JSON으로만 출력. reason에는 (1) 컷의 visual_intent, (2) 썸네일에 실제로 보이는 시각 요소, (3) 둘이 어떻게 일치하는지 적어.
 
 {"assignments": [
-  {"cut": 0, "clip_id": "C3", "reason": "문장 '혹시 양파 망째로 보관하시면'→양파와 보관이 주제 / 썸네일에 망에 담긴 양파 보임 / 정확히 일치"},
+  {"cut": 0, "clip_id": "C3", "score": 9, "reason": "intent='보관 행위 보여주기' / 썸네일에 비닐 덮인 김치통 보임 / 정확히 일치"},
   ...
 ]}
 """
@@ -261,7 +253,7 @@ reason에는 반드시: (1) 해당 문장이 말하는 것, (2) 썸네일에 실
             parts.append(types.Part.from_bytes(data=thumb_bytes, mime_type="image/jpeg"))
     parts.append(footer)
 
-    print(f"  Matching {len(cuts)} cuts to {len(paths_ordered)} clips (visual + context)...")
+    print(f"  Matching {len(cuts)} cuts to {len(paths_ordered)} usable clips...")
     resp = _generate_with_retry(client, GEMINI_TEXT_MODEL, parts)
 
     for f in tmp_dir.glob("*"):
@@ -272,35 +264,97 @@ reason에는 반드시: (1) 해당 문장이 말하는 것, (2) 썸네일에 실
     id_to_path = {f"C{i}": paths_ordered[i] for i in range(len(paths_ordered))}
 
     assignments = data.get("assignments", [])
-    by_cut: dict[int, tuple[str, str]] = {}
+    by_cut: dict[int, tuple[str, str, int]] = {}
     for a in assignments:
-        by_cut[int(a["cut"])] = (str(a["clip_id"]), str(a.get("reason", "")))
+        by_cut[int(a["cut"])] = (str(a["clip_id"]), str(a.get("reason", "")), int(a.get("score", 0)))
 
-    result: list[str] = []
-    reasons: list[str] = []
+    result_paths: list[str] = []
+    result_reasons: list[str] = []
     for i in range(len(cuts)):
         entry = by_cut.get(i)
         if entry is None or entry[0] not in id_to_path:
             cid = f"C{i % len(paths_ordered)}"
-            reasons.append("(fallback: matcher skipped this cut)")
+            result_paths.append(id_to_path[cid])
+            result_reasons.append("(fallback: matcher skipped this cut)")
         else:
-            cid = entry[0]
-            reasons.append(entry[1])
-        result.append(id_to_path[cid])
+            cid, reason, score = entry
+            result_paths.append(id_to_path[cid])
+            result_reasons.append(f"[score={score}] {reason}")
+    return result_paths, result_reasons
 
-    # Stash reasons for save_matches to pick up.
+
+def match_clips(
+    cuts: list[tuple[float, float]],
+    captions: list[dict],
+    clips_analysis: dict[str, ClipAnalysis],
+    style: dict,
+    total_duration: float,
+    narration_text: str = "",
+    words: list[dict] | None = None,
+) -> list[str]:
+    """Two-stage matching. Filters unusable clips. Returns clip path per cut."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY not set.")
+    client = genai.Client(api_key=GEMINI_API_KEY)
+
+    usable = {p: a for p, a in clips_analysis.items() if a.usable}
+    skipped = len(clips_analysis) - len(usable)
+    if skipped:
+        print(f"  Filtering out {skipped} unusable clip(s) (outro/logo/watermark).")
+    if not usable:
+        raise RuntimeError("No usable clips after filtering. Check vision analysis.")
+
+    hook_end = float(style.get("hook", {}).get("opening_duration_sec", 2.0))
+    ending_duration = float(style.get("ending", {}).get("duration_sec", 3.0))
+
+    words = words or []
+    sentences = _split_sentences(words)
+    sentences_payload = [
+        {"sentence_index": i, "start": round(s["start"], 2), "end": round(s["end"], 2),
+         "text": s["text"]}
+        for i, s in enumerate(sentences)
+    ]
+
+    plans = _plan_sentences(client, sentences_payload, narration_text, style)
+
+    cut_entries = []
+    for i, (t_start, t_end) in enumerate(cuts):
+        phase = _classify_phase(i, len(cuts), t_start, hook_end, ending_duration, total_duration)
+        owning_idx = next(
+            (s["sentence_index"] for s in sentences_payload
+             if s["start"] <= (t_start + t_end) / 2 <= s["end"]),
+            None,
+        )
+        owning_text = next(
+            (s["text"] for s in sentences_payload if s["sentence_index"] == owning_idx),
+            "",
+        )
+        cut_entries.append({
+            "index": i,
+            "time": f"{t_start:.2f}-{t_end:.2f}s",
+            "phase": phase,
+            "owning_sentence_index": owning_idx,
+            "owning_sentence_text": owning_text,
+        })
+
+    paths, reasons = _assign_clips(client, cut_entries, plans, usable, style, narration_text)
     match_clips.last_reasons = reasons  # type: ignore[attr-defined]
-    return result
+    match_clips.last_plans = plans  # type: ignore[attr-defined]
+    return paths
 
 
 def save_matches(cuts: list[tuple[float, float]], cut_texts: list[str],
                  paths: list[str], out_path: Path) -> None:
     reasons = getattr(match_clips, "last_reasons", [""] * len(cuts))
-    payload = [
-        {"cut": i, "start": cuts[i][0], "end": cuts[i][1],
-         "caption": cut_texts[i], "clip": Path(paths[i]).name,
-         "reason": reasons[i] if i < len(reasons) else ""}
-        for i in range(len(cuts))
-    ]
+    plans = getattr(match_clips, "last_plans", [])
+    payload = {
+        "sentence_plans": plans,
+        "cuts": [
+            {"cut": i, "start": cuts[i][0], "end": cuts[i][1],
+             "caption": cut_texts[i], "clip": Path(paths[i]).name,
+             "reason": reasons[i] if i < len(reasons) else ""}
+            for i in range(len(cuts))
+        ],
+    }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
