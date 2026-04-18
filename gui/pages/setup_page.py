@@ -13,6 +13,11 @@ from PyQt6.QtWidgets import (
 from gui import config_store
 
 
+def _default_projects_root() -> Path:
+    docs = Path.home() / "Documents" / "ShortsEditor" / "projects"
+    return docs
+
+
 class SetupPage(QWidget):
     run_requested = pyqtSignal(dict)
 
@@ -24,14 +29,15 @@ class SetupPage(QWidget):
 
         title = QLabel("새 영상 만들기")
         title.setProperty("class", "sectionTitle")
-        sub = QLabel("나레이션과 클립을 선택하면 AI가 편집 초안을 만들어요.")
+        sub = QLabel("프로젝트 이름만 입력하면 Documents\\ShortsEditor\\projects\\ 아래에 자동 폴더가 생성됩니다.")
         sub.setProperty("class", "sectionSub")
         layout.addWidget(title)
         layout.addWidget(sub)
 
         self.project_name = QLineEdit()
         self.project_name.setPlaceholderText("예: onion_shorts_001")
-        layout.addLayout(self._field("프로젝트 이름 (CapCut 프로젝트로 저장됨)", self.project_name))
+        self.project_name.textChanged.connect(self._on_project_name_changed)
+        layout.addLayout(self._field("프로젝트 이름 (CapCut 프로젝트로도 저장됨)", self.project_name))
 
         self.narration_edit = QLineEdit()
         self.narration_edit.setReadOnly(True)
@@ -62,16 +68,23 @@ class SetupPage(QWidget):
                                                   self.ref_edit, [btn_ref, btn_ref_clear]))
 
         self.output_edit = QLineEdit()
-        self.output_edit.setReadOnly(True)
-        self.output_edit.setPlaceholderText("분석 결과 & 뷰어를 저장할 폴더")
+        self.output_edit.setPlaceholderText("자동: Documents\\ShortsEditor\\projects\\<이름>\\output")
         btn_out = QPushButton("폴더 선택")
         btn_out.setProperty("class", "secondary")
         btn_out.clicked.connect(self._pick_output)
-        layout.addLayout(self._field_with_button("작업 폴더", self.output_edit, btn_out))
+        btn_out_reset = QPushButton("기본값")
+        btn_out_reset.setProperty("class", "secondary")
+        btn_out_reset.clicked.connect(self._reset_output_to_default)
+        layout.addLayout(self._field_with_buttons("작업 폴더 (분석 결과 저장 위치)",
+                                                   self.output_edit, [btn_out, btn_out_reset]))
 
         self.semantic_chk = QCheckBox("Gemini 의미 매칭 사용 (권장)")
         self.semantic_chk.setChecked(True)
         layout.addWidget(self.semantic_chk)
+
+        self.strip_silence_chk = QCheckBox("나레이션 무음 구간 전부 제거 (권장)")
+        self.strip_silence_chk.setChecked(True)
+        layout.addWidget(self.strip_silence_chk)
 
         self.selections_chk = QCheckBox("뷰어에서 저장한 선택(selections.json) 적용해서 재생성")
         layout.addWidget(self.selections_chk)
@@ -86,6 +99,7 @@ class SetupPage(QWidget):
         btns.addWidget(self.run_btn)
         layout.addLayout(btns)
 
+        self._user_touched_output = False
         self._load_defaults()
 
     def _field(self, label_text: str, widget) -> QVBoxLayout:
@@ -127,8 +141,28 @@ class SetupPage(QWidget):
         self.narration_edit.setText(last.get("narration", ""))
         self.clips_edit.setText(last.get("clips_dir", ""))
         self.ref_edit.setText(last.get("reference", ""))
-        self.output_edit.setText(last.get("output_dir", ""))
         self.project_name.setText(last.get("project_name", ""))
+        saved_output = last.get("output_dir", "")
+        # If the saved output is under Desktop (the old default), quietly
+        # migrate the user to the new Documents location.
+        desktop = str(Path.home() / "Desktop")
+        if saved_output and desktop.lower() in saved_output.lower():
+            saved_output = ""
+        self.output_edit.setText(saved_output)
+        if not saved_output:
+            self._refresh_default_output()
+
+    def _on_project_name_changed(self, _text: str) -> None:
+        if not self._user_touched_output:
+            self._refresh_default_output()
+
+    def _refresh_default_output(self) -> None:
+        name = self.project_name.text().strip()
+        if not name:
+            self.output_edit.setText("")
+            return
+        default = _default_projects_root() / name / "output"
+        self.output_edit.setText(str(default))
 
     def _pick_narration(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "나레이션 오디오 선택", "",
@@ -148,28 +182,42 @@ class SetupPage(QWidget):
             self.ref_edit.setText(path)
 
     def _pick_output(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "작업 폴더 선택")
+        start = self.output_edit.text() or str(_default_projects_root())
+        path = QFileDialog.getExistingDirectory(self, "작업 폴더 선택", start)
         if path:
             self.output_edit.setText(path)
+            self._user_touched_output = True
+
+    def _reset_output_to_default(self) -> None:
+        self._user_touched_output = False
+        self._refresh_default_output()
 
     def _on_run(self) -> None:
         name = self.project_name.text().strip()
         narration = self.narration_edit.text().strip()
         clips = self.clips_edit.text().strip()
         output = self.output_edit.text().strip()
-        if not (name and narration and clips and output):
-            QMessageBox.warning(self, "입력 부족",
-                                "프로젝트 이름, 나레이션, 클립 폴더, 작업 폴더를 모두 지정하세요.")
+        if not name:
+            QMessageBox.warning(self, "입력 부족", "프로젝트 이름을 입력하세요.")
             return
+        if not narration:
+            QMessageBox.warning(self, "입력 부족", "나레이션 오디오 파일을 선택하세요.")
+            return
+        if not clips:
+            QMessageBox.warning(self, "입력 부족", "소스 영상 폴더를 선택하세요.")
+            return
+        if not output:
+            # No output chosen and name is set — fill with default.
+            self._refresh_default_output()
+            output = self.output_edit.text().strip()
 
         config_store.save({
+            **config_store.load(),
             "project_name": name,
             "narration": narration,
             "clips_dir": clips,
             "reference": self.ref_edit.text().strip(),
             "output_dir": output,
-            **{k: v for k, v in config_store.load().items()
-               if k not in {"project_name", "narration", "clips_dir", "reference", "output_dir"}},
         })
 
         Path(output).mkdir(parents=True, exist_ok=True)
@@ -181,4 +229,5 @@ class SetupPage(QWidget):
             "output_dir": output,
             "use_semantic": self.semantic_chk.isChecked(),
             "use_selections": self.selections_chk.isChecked(),
+            "strip_silence": self.strip_silence_chk.isChecked(),
         })

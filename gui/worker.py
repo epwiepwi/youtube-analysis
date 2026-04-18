@@ -65,6 +65,7 @@ class GenerationWorker(QObject):
                     use_semantic=bool(p.get("use_semantic", False)),
                     reference_video=Path(p["reference"]) if p.get("reference") else None,
                     use_selections=bool(p.get("use_selections", False)),
+                    strip_silence=bool(p.get("strip_silence", True)),
                     progress=cb,
                 )
             self.finished.emit(str(project_dir))
