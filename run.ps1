@@ -3,7 +3,8 @@ param(
     [string]$Clips = "$HOME\Desktop\clips",
     [string]$Name = "shorts_001",
     [string]$Model = "small",
-    [string]$Device = "cpu"
+    [string]$Device = "cpu",
+    [switch]$Semantic
 )
 
 $OutputEncoding = [System.Text.Encoding]::UTF8
@@ -19,6 +20,10 @@ Write-Host "narration: $Narration"
 Write-Host "clips    : $Clips"
 Write-Host "name     : $Name"
 Write-Host "model    : $Model on $Device"
+Write-Host "semantic : $Semantic"
 Write-Host ""
 
-python -m src.main --narration "$Narration" --clips "$Clips" --name "$Name"
+$extra = @()
+if ($Semantic) { $extra += "--semantic" }
+
+python -m src.main --narration "$Narration" --clips "$Clips" --name "$Name" @extra

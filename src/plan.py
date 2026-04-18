@@ -168,18 +168,78 @@ def build_captions(transcript: Transcript, style: dict) -> list[CaptionSegment]:
     return out
 
 
+def assign_clips_by_paths(cut_points: list[float], paths: list[str], clips: list[Clip]) -> list[VideoSegment]:
+    """Build VideoSegment list using explicit clip path per cut (from semantic matcher)."""
+    by_path = {str(c.path): c for c in clips}
+    segments: list[VideoSegment] = []
+    revisit: dict[str, int] = {}
+    for idx in range(len(cut_points) - 1):
+        t_start = cut_points[idx]
+        t_end = cut_points[idx + 1]
+        needed = t_end - t_start
+        path_key = paths[idx]
+        clip = by_path.get(path_key) or clips[idx % len(clips)]
+        visits = revisit.get(str(clip.path), 0)
+        revisit[str(clip.path)] = visits + 1
+
+        if clip.duration <= needed:
+            src_start = 0.0
+            src_end = clip.duration
+        else:
+            slack = clip.duration - needed
+            src_start = min(slack, visits * (slack / 3) + slack * 0.1)
+            src_end = src_start + needed
+
+        segments.append(VideoSegment(
+            clip=clip,
+            source_start=round(src_start, 3),
+            source_end=round(src_end, 3),
+            timeline_start=round(t_start, 3),
+            timeline_end=round(t_end, 3),
+        ))
+    return segments
+
+
 def build_plan(
     narration_path: Path,
     transcript: Transcript,
     clip_dir: Path,
     style: dict,
+    use_semantic: bool = False,
+    output_dir: Path | None = None,
 ) -> EditPlan:
     clips = load_clips(clip_dir)
     cut_points = compute_cut_points(transcript, style)
     if cut_points[-1] < transcript.duration:
         cut_points.append(transcript.duration)
-    segments = assign_clips_to_cuts(cut_points, clips)
     captions = build_captions(transcript, style)
+
+    if use_semantic:
+        from .matcher import match_clips, save_matches
+        from .vision import build_clips_index
+
+        cache_path = (output_dir or Path("output")) / "clips_index.json"
+        print("  Analyzing clips with Gemini Vision...")
+        clips_analysis = build_clips_index([c.path for c in clips], cache_path)
+
+        cuts_tuples = [(cut_points[i], cut_points[i + 1]) for i in range(len(cut_points) - 1)]
+        captions_dicts = [{"text": c.text, "start": c.start, "end": c.end} for c in captions]
+        print("  Matching clips to cuts with Gemini...")
+        clip_paths = match_clips(
+            cuts=cuts_tuples,
+            captions=captions_dicts,
+            clips_analysis=clips_analysis,
+            style=style,
+            total_duration=transcript.duration,
+        )
+        if output_dir:
+            from .matcher import _tag_cuts_with_captions
+            cut_texts = _tag_cuts_with_captions(cuts_tuples, captions_dicts)
+            save_matches(cuts_tuples, cut_texts, clip_paths, output_dir / "matches.json")
+        segments = assign_clips_by_paths(cut_points, clip_paths, clips)
+    else:
+        segments = assign_clips_to_cuts(cut_points, clips)
+
     return EditPlan(
         narration_path=narration_path,
         narration_duration=transcript.duration,
