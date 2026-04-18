@@ -32,11 +32,12 @@ class ClipAnalysis:
     suitability: dict[str, int] = field(default_factory=dict)
 
 
-ANALYSIS_PROMPT = """이 영상 클립의 프레임들을 보고 JSON으로만 답해줘. 한국어로 작성.
+ANALYSIS_PROMPT = """이 영상 클립의 프레임 여러 장을 보고 JSON으로만 답해줘. 한국어로 작성.
+중요: "무엇이 실제로 화면에 보이는지"를 구체적으로 써줘 (사람 있음/없음, 사물, 색감, 상황).
 
 {
-  "description": "이 클립에 무엇이 보이는지 1-2문장 설명",
-  "tags": ["주제 키워드 3-6개"],
+  "description": "이 클립에서 실제로 보이는 것 2-3문장. 인물(성별/행동), 등장 사물, 배경, 분위기 포함",
+  "tags": ["구체적 키워드 5-8개 — 사물명, 행동, 상태 등. 예: '양파', '곰팡이', '주방', '썰기'"],
   "visual_impact": 1-10 (시각적 충격/자극도, 10이 가장 강렬),
   "emotion": "shock | warning | calm | clean | disgusting | action | mundane 중 하나",
   "suitability": {
@@ -47,7 +48,7 @@ ANALYSIS_PROMPT = """이 영상 클립의 프레임들을 보고 JSON으로만 �
   }
 }
 
-다른 설명 없이 JSON만 출력해."""
+다른 설명 없이 JSON만 출력."""
 
 
 def _extract_frames(clip_path: Path, count: int = 3) -> list[Path]:
@@ -141,9 +142,10 @@ def build_clips_index(clip_paths: list[Path], cache_path: Path) -> dict[str, Cli
 
     result: dict[str, ClipAnalysis] = {}
     dirty = False
+    prompt_version = "v2"
     for cp in clip_paths:
         sig = _clip_signature(cp)
-        key = f"{cp.name}:{sig[:12]}"
+        key = f"{prompt_version}:{cp.name}:{sig[:12]}"
         if key in cache:
             result[str(cp)] = ClipAnalysis(**cache[key])
             continue
