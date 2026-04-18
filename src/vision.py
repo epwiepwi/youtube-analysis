@@ -11,10 +11,12 @@ import hashlib
 import json
 import subprocess
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 from .config import GEMINI_API_KEY, GEMINI_VISION_MODEL
@@ -92,15 +94,27 @@ def _parse_json(text: str) -> dict:
     return json.loads(text[start : end + 1])
 
 
+def _generate_with_retry(client: genai.Client, model: str, contents, max_attempts: int = 5):
+    delay = 4.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.models.generate_content(model=model, contents=contents)
+        except (genai_errors.ServerError, genai_errors.APIError) as e:
+            code = getattr(e, "code", None) or getattr(getattr(e, "response", None), "status_code", None)
+            if code in (429, 500, 502, 503, 504) and attempt < max_attempts:
+                print(f"    [{code}] Gemini busy, retry {attempt}/{max_attempts} in {delay:.0f}s...")
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+            raise
+
+
 def analyze_clip(clip_path: Path, client: genai.Client) -> ClipAnalysis:
     frames = _extract_frames(clip_path, count=3)
     parts: list = [ANALYSIS_PROMPT]
     for f in frames:
         parts.append(types.Part.from_bytes(data=f.read_bytes(), mime_type="image/jpeg"))
-    resp = client.models.generate_content(
-        model=GEMINI_VISION_MODEL,
-        contents=parts,
-    )
+    resp = _generate_with_retry(client, GEMINI_VISION_MODEL, parts)
     data = _parse_json(resp.text)
     for f in frames:
         f.unlink(missing_ok=True)
@@ -138,6 +152,9 @@ def build_clips_index(clip_paths: list[Path], cache_path: Path) -> dict[str, Cli
         result[str(cp)] = analysis
         cache[key] = asdict(analysis)
         dirty = True
+        # Persist after every successful clip so a later failure doesn't lose work.
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if dirty:
         cache_path.parent.mkdir(parents=True, exist_ok=True)

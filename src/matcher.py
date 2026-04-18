@@ -8,12 +8,29 @@ problem -> solution structure from the style profile).
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from google import genai
+from google.genai import errors as genai_errors
 
 from .config import GEMINI_API_KEY, GEMINI_TEXT_MODEL
 from .vision import ClipAnalysis
+
+
+def _generate_with_retry(client: genai.Client, model: str, contents, max_attempts: int = 5):
+    delay = 4.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.models.generate_content(model=model, contents=contents)
+        except (genai_errors.ServerError, genai_errors.APIError) as e:
+            code = getattr(e, "code", None) or getattr(getattr(e, "response", None), "status_code", None)
+            if code in (429, 500, 502, 503, 504) and attempt < max_attempts:
+                print(f"  [{code}] Gemini busy, retry {attempt}/{max_attempts} in {delay:.0f}s...")
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+            raise
 
 
 def _parse_json(text: str) -> dict:
@@ -120,10 +137,7 @@ def match_clips(
 {{"assignments": [{{"cut": 0, "clip_id": "C3", "reason": "..." }}, ...]}}
 """
 
-    resp = client.models.generate_content(
-        model=GEMINI_TEXT_MODEL,
-        contents=prompt,
-    )
+    resp = _generate_with_retry(client, GEMINI_TEXT_MODEL, prompt)
     data = _parse_json(resp.text)
     id_to_path = {f"C{i}": paths_ordered[i] for i in range(len(paths_ordered))}
 
