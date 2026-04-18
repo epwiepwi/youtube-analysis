@@ -298,11 +298,18 @@ def match_clips(
     client = genai.Client(api_key=GEMINI_API_KEY)
 
     usable = {p: a for p, a in clips_analysis.items() if a.usable}
-    skipped = len(clips_analysis) - len(usable)
+    skipped = [(p, a) for p, a in clips_analysis.items() if not a.usable]
     if skipped:
-        print(f"  Filtering out {skipped} unusable clip(s) (outro/logo/watermark).")
+        print(f"  Filtering out {len(skipped)} unusable clip(s):")
+        for p, a in skipped:
+            print(f"    - {Path(p).name} [{a.clip_type}]: {a.skip_reason or '(no reason)'}")
     if not usable:
-        raise RuntimeError("No usable clips after filtering. Check vision analysis.")
+        raise RuntimeError(
+            "All clips marked as unusable. The filter may be too aggressive — "
+            "delete output/clips_index.json and re-run to re-analyze."
+        )
+    if len(usable) < 3:
+        print(f"  Warning: only {len(usable)} usable clips. Matching quality will suffer.")
 
     hook_end = float(style.get("hook", {}).get("opening_duration_sec", 2.0))
     ending_duration = float(style.get("ending", {}).get("duration_sec", 3.0))
