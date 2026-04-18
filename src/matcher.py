@@ -493,7 +493,8 @@ def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[d
 
     # Hard reuse cap as a safety net for when Gemini ignores the rule.
     result_paths, result_reasons = _enforce_reuse_cap(
-        result_paths, result_reasons, clips_analysis, plans_by_sent, cuts, max_reuse=2,
+        result_paths, result_reasons, clips_analysis, plans_by_sent, cuts,
+        max_per_scene=2, max_per_file=2,
     )
     return result_paths, result_reasons
 
