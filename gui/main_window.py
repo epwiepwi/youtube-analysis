@@ -113,12 +113,12 @@ class MainWindow(QWidget):
         # Propagate settings to subprocess env so src/config.py picks them up.
         if api_key:
             os.environ["GEMINI_API_KEY"] = api_key
-        if cfg.get("whisper_model"):
-            os.environ["WHISPER_MODEL"] = cfg["whisper_model"]
-        if cfg.get("whisper_device"):
-            os.environ["WHISPER_DEVICE"] = cfg["whisper_device"]
-            if cfg["whisper_device"] == "cpu":
-                os.environ["WHISPER_COMPUTE"] = "int8"
+        os.environ["WHISPER_MODEL"] = cfg.get("whisper_model") or "small"
+        device = cfg.get("whisper_device") or "cpu"
+        os.environ["WHISPER_DEVICE"] = device
+        os.environ["WHISPER_COMPUTE"] = (
+            "int8" if device == "cpu" else cfg.get("whisper_compute") or "float16"
+        )
 
         self._last_params = params
         self.progress_page.reset()

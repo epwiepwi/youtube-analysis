@@ -33,9 +33,9 @@ PATHS = Paths(
     capcut_draft_root=_default_capcut_root(),
 )
 
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
-WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "auto")
-WHISPER_COMPUTE = os.environ.get("WHISPER_COMPUTE", "default")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
+WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE = os.environ.get("WHISPER_COMPUTE", "int8")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", "gemini-2.5-flash")
