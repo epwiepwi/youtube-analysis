@@ -147,18 +147,45 @@ def _parse_json(text: str) -> dict:
 
 
 def _generate_with_retry(client: genai.Client, model: str, contents, max_attempts: int = 5):
+    """Retry on transient 4xx/5xx and fall back to a less-loaded model if
+    the primary keeps returning 503s."""
+    fallback_models = [
+        m.strip() for m in os.environ.get(
+            "GEMINI_FALLBACK_MODELS",
+            "gemini-2.0-flash,gemini-1.5-flash-latest",
+        ).split(",") if m.strip() and m.strip() != model
+    ]
+    attempted_models = [model] + fallback_models
     delay = 4.0
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return client.models.generate_content(model=model, contents=contents)
-        except (genai_errors.ServerError, genai_errors.APIError) as e:
-            code = getattr(e, "code", None) or getattr(getattr(e, "response", None), "status_code", None)
-            if code in (429, 500, 502, 503, 504) and attempt < max_attempts:
-                print(f"    [{code}] Gemini busy, retry {attempt}/{max_attempts} in {delay:.0f}s...")
-                time.sleep(delay)
-                delay = min(delay * 2, 60)
-                continue
-            raise
+    last_err: Exception | None = None
+
+    for m_idx, active_model in enumerate(attempted_models):
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return client.models.generate_content(
+                    model=active_model, contents=contents
+                )
+            except (genai_errors.ServerError, genai_errors.APIError) as e:
+                code = getattr(e, "code", None) or getattr(
+                    getattr(e, "response", None), "status_code", None
+                )
+                last_err = e
+                if code not in (429, 500, 502, 503, 504):
+                    raise
+                if attempt < max_attempts:
+                    print(f"    [{code}] {active_model} busy, retry {attempt}/{max_attempts} in {delay:.0f}s...")
+                    time.sleep(delay)
+                    delay = min(delay * 2, 60)
+                    continue
+                # Exhausted attempts on this model — try next fallback.
+                if m_idx < len(attempted_models) - 1:
+                    next_model = attempted_models[m_idx + 1]
+                    print(f"    {active_model} exhausted; falling back to {next_model}")
+                    delay = 4.0
+                    break
+                raise
+    if last_err:
+        raise last_err
 
 
 def _safe_int(value, default: int = 5) -> int:
