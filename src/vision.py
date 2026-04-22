@@ -22,8 +22,42 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 
-from .config import GEMINI_API_KEY, GEMINI_VISION_MODEL
+from .config import GEMINI_VISION_MODEL, current_gemini_keys
 from .plan import Clip
+
+
+class KeyPool:
+    """Round-robin pool of Gemini clients so we can parallelize across
+    multiple API keys and survive 503/429 spikes on any single key."""
+
+    def __init__(self, keys: list[str]):
+        if not keys:
+            raise RuntimeError(
+                "No Gemini API keys configured. Set GEMINI_API_KEY or "
+                "GEMINI_API_KEYS (comma separated) in the app settings."
+            )
+        self._clients = [genai.Client(api_key=k) for k in keys]
+        self._idx = 0
+        self._lock = __import__("threading").Lock()
+
+    def __len__(self) -> int:
+        return len(self._clients)
+
+    def next(self) -> genai.Client:
+        with self._lock:
+            client = self._clients[self._idx % len(self._clients)]
+            self._idx += 1
+            return client
+
+
+_default_pool: KeyPool | None = None
+
+
+def get_default_pool() -> KeyPool:
+    global _default_pool
+    if _default_pool is None:
+        _default_pool = KeyPool(GEMINI_API_KEYS)
+    return _default_pool
 
 
 # Concurrency for vision analysis. Free tier is ~15 RPM so default 10 leaves
@@ -150,9 +184,13 @@ _RETRYABLE_CODES = (429, 500, 502, 503, 504)
 _ROTATE_CODES = (404, 400)  # 404 = retired model; 400 = bad model name
 
 
-def _generate_with_retry(client: genai.Client, model: str, contents, max_attempts: int = 5):
-    """Retry on transient errors and fall back to a different model when the
-    primary is busy (503) or has been retired (404)."""
+def _generate_with_retry(pool_or_client, model: str, contents, max_attempts: int = 5):
+    """Retry transient errors, rotate API keys per attempt, and fall back
+    to a secondary model if the primary keeps failing.
+
+    `pool_or_client` accepts either a KeyPool (new) or a single Client
+    (legacy callers); in the single-client case rotation is a no-op.
+    """
     fallback_models = [
         m.strip() for m in os.environ.get(
             "GEMINI_FALLBACK_MODELS",
@@ -162,9 +200,17 @@ def _generate_with_retry(client: genai.Client, model: str, contents, max_attempt
     attempted_models = [model] + fallback_models
     last_err: Exception | None = None
 
+    def get_client():
+        if isinstance(pool_or_client, KeyPool):
+            return pool_or_client.next()
+        return pool_or_client
+
+    pool_size = len(pool_or_client) if isinstance(pool_or_client, KeyPool) else 1
+
     for m_idx, active_model in enumerate(attempted_models):
         delay = 4.0
         for attempt in range(1, max_attempts + 1):
+            client = get_client()
             try:
                 return client.models.generate_content(
                     model=active_model, contents=contents
@@ -175,7 +221,6 @@ def _generate_with_retry(client: genai.Client, model: str, contents, max_attempt
                 )
                 last_err = e
                 if code in _ROTATE_CODES:
-                    # Model isn't usable at all — skip straight to next fallback.
                     if m_idx < len(attempted_models) - 1:
                         next_model = attempted_models[m_idx + 1]
                         print(f"    [{code}] {active_model} unavailable; switching to {next_model}")
@@ -184,7 +229,8 @@ def _generate_with_retry(client: genai.Client, model: str, contents, max_attempt
                 if code not in _RETRYABLE_CODES:
                     raise
                 if attempt < max_attempts:
-                    print(f"    [{code}] {active_model} busy, retry {attempt}/{max_attempts} in {delay:.0f}s...")
+                    key_hint = f" (rotating through {pool_size} key{'s' if pool_size != 1 else ''})" if pool_size > 1 else ""
+                    print(f"    [{code}] {active_model} busy, retry {attempt}/{max_attempts} in {delay:.0f}s{key_hint}...")
                     time.sleep(delay)
                     delay = min(delay * 2, 60)
                     continue
@@ -222,7 +268,7 @@ def _build_analysis(data: dict, clip: Clip) -> ClipAnalysis:
     )
 
 
-def analyze_scene(clip: Clip, client: genai.Client) -> ClipAnalysis:
+def analyze_scene(clip: Clip, pool: "KeyPool | genai.Client") -> ClipAnalysis:
     """Send one scene as video. Kept for single-clip fallbacks."""
     video_path = _extract_scene_clip(clip)
     try:
@@ -230,7 +276,7 @@ def analyze_scene(clip: Clip, client: genai.Client) -> ClipAnalysis:
             ANALYSIS_PROMPT,
             types.Part.from_bytes(data=video_path.read_bytes(), mime_type="video/mp4"),
         ]
-        resp = _generate_with_retry(client, GEMINI_VISION_MODEL, parts)
+        resp = _generate_with_retry(pool, GEMINI_VISION_MODEL, parts)
         data = _parse_json(resp.text)
     finally:
         try:
@@ -279,7 +325,7 @@ description은 동작까지 포함 ("손이 누름판을 꾹 누르는 중" 같�
 JSON만 출력. 다른 설명 금지. 반드시 배열 순서가 [S0][S1]... 순서와 같아야 함."""
 
 
-def analyze_batch(clips: list[Clip], client: genai.Client) -> list[ClipAnalysis]:
+def analyze_batch(clips: list[Clip], pool: "KeyPool | genai.Client") -> list[ClipAnalysis]:
     """Send up to ANALYSIS_BATCH_SIZE scenes in one Gemini call."""
     if not clips:
         return []
@@ -294,7 +340,7 @@ def analyze_batch(clips: list[Clip], client: genai.Client) -> list[ClipAnalysis]
                 data=video_path.read_bytes(), mime_type="video/mp4"
             ))
 
-        resp = _generate_with_retry(client, GEMINI_VISION_MODEL, parts)
+        resp = _generate_with_retry(pool, GEMINI_VISION_MODEL, parts)
         data = _parse_json(resp.text)
     finally:
         for vp in video_paths:
@@ -320,9 +366,11 @@ def analyze_batch(clips: list[Clip], client: genai.Client) -> list[ClipAnalysis]
 
 def build_clips_index(clips: list[Clip], cache_path: Path) -> dict[str, ClipAnalysis]:
     """Analyze each scene in parallel via video input. Cached by file sig + range."""
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY not set. Create .env with GEMINI_API_KEY=... or skip semantic matching.")
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    keys = current_gemini_keys()
+    if not keys:
+        raise RuntimeError("No Gemini API keys configured. Add at least one in Settings.")
+    pool = KeyPool(keys)
+    print(f"  Gemini key pool size: {len(pool)}")
     cache: dict[str, dict] = {}
     if cache_path.exists():
         try:
@@ -369,7 +417,7 @@ def build_clips_index(clips: list[Clip], cache_path: Path) -> dict[str, ClipAnal
 
     def run_batch(batch: list[Clip]) -> tuple[list[Clip], list[ClipAnalysis] | None, str | None]:
         try:
-            return batch, analyze_batch(batch, client), None
+            return batch, analyze_batch(batch, pool), None
         except Exception as e:
             return batch, None, f"{type(e).__name__}: {e}"
 
@@ -378,17 +426,15 @@ def build_clips_index(clips: list[Clip], cache_path: Path) -> dict[str, ClipAnal
         f"{ANALYSIS_BATCH_SIZE} scene(s), with {ANALYSIS_CONCURRENCY} parallel workers..."
     )
 
-    with ThreadPoolExecutor(max_workers=ANALYSIS_CONCURRENCY) as pool:
-        futures = [pool.submit(run_batch, b) for b in batches]
+    with ThreadPoolExecutor(max_workers=ANALYSIS_CONCURRENCY) as executor:
+        futures = [executor.submit(run_batch, b) for b in batches]
         for fut in as_completed(futures):
             batch, analyses, error = fut.result()
             if error or analyses is None:
                 print(f"    batch FAILED ({len(batch)} scenes): {error} — retrying per-scene")
-                # Fall back to per-scene for this batch so one bad clip
-                # doesn't poison the whole batch.
                 for clip in batch:
                     try:
-                        analysis = analyze_scene(clip, client)
+                        analysis = analyze_scene(clip, pool)
                     except Exception as e:
                         print(f"    per-scene FAIL {clip.id}: {e}")
                         continue

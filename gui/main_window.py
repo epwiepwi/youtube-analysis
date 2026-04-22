@@ -103,16 +103,23 @@ class MainWindow(QWidget):
 
     def _start_run(self, params: dict) -> None:
         cfg = config_store.load()
-        api_key = cfg.get("gemini_api_key", "")
-        if params.get("use_semantic") and not api_key:
-            QMessageBox.warning(self, "API 키 필요",
-                                "의미 매칭을 쓰려면 설정에서 Gemini API 키를 먼저 입력하세요.")
+        api_keys = cfg.get("gemini_api_keys") or ([cfg["gemini_api_key"]] if cfg.get("gemini_api_key") else [])
+        api_keys = [k for k in api_keys if k]
+        if params.get("use_semantic") and not api_keys:
+            QMessageBox.warning(self, "Gemini API 키 필요",
+                                "의미 매칭을 쓰려면 설정에서 Gemini API 키를 최소 한 개 입력하세요.")
             self._show("settings")
             return
 
         # Propagate settings to subprocess env so src/config.py picks them up.
-        if api_key:
-            os.environ["GEMINI_API_KEY"] = api_key
+        if api_keys:
+            os.environ["GEMINI_API_KEYS"] = "\n".join(api_keys)
+            os.environ["GEMINI_API_KEY"] = api_keys[0]  # backwards-compat
+        openai_key = cfg.get("openai_api_key", "")
+        if openai_key:
+            os.environ["OPENAI_API_KEY"] = openai_key
+        else:
+            os.environ.pop("OPENAI_API_KEY", None)
         os.environ["WHISPER_MODEL"] = cfg.get("whisper_model") or "small"
         device = cfg.get("whisper_device") or "cpu"
         os.environ["WHISPER_DEVICE"] = device

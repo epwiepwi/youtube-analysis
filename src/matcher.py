@@ -21,8 +21,9 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 
-from .config import GEMINI_API_KEY, GEMINI_TEXT_MODEL
-from .vision import ClipAnalysis, _generate_with_retry
+from .config import (GEMINI_TEXT_MODEL, OPENAI_TEXT_MODEL,
+                      current_gemini_keys, current_openai_key)
+from .vision import ClipAnalysis, KeyPool, _generate_with_retry
 
 
 def _parse_json(text: str) -> dict:
@@ -139,12 +140,54 @@ def _extract_thumbnail(source_file: Path, scene_start: float, scene_end: float,
     return out
 
 
-def _generate_json_with_retry(client: genai.Client, model: str, contents,
+def _plan_with_openai(prompt: str, label: str = "Stage1") -> dict:
+    """Use OpenAI GPT for the Stage 1 text planner.
+
+    Moving planning off Gemini frees up Gemini quota for the vision-heavy
+    Stage 2 and spreads load across providers so a single 503 storm
+    doesn't kill the run.
+    """
+    from openai import OpenAI
+
+    client = OpenAI(api_key=current_openai_key())
+    delay = 3.0
+    last_err: Exception | None = None
+    for attempt in range(1, 5):
+        try:
+            resp = client.chat.completions.create(
+                model=OPENAI_TEXT_MODEL,
+                messages=[
+                    {"role": "system", "content": "JSON만 출력하는 편집 디렉터."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.4,
+            )
+            body = resp.choices[0].message.content or "{}"
+            return json.loads(body)
+        except json.JSONDecodeError as e:
+            last_err = e
+            print(f"  [{label}] OpenAI JSON parse failed: {e}")
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            if any(sig in msg for sig in ("429", "500", "502", "503", "504", "timeout")):
+                print(f"  [{label}] OpenAI busy, retry {attempt} in {delay:.0f}s...")
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
+            raise
+    if last_err:
+        raise last_err
+    return {}
+
+
+def _generate_json_with_retry(client_or_pool, model: str, contents,
                                label: str = "call", max_json_retries: int = 2) -> dict:
     """Wrapper that retries on malformed JSON output."""
     last_error = None
     for attempt in range(max_json_retries + 1):
-        resp = _generate_with_retry(client, model, contents)
+        resp = _generate_with_retry(client_or_pool, model, contents)
         try:
             return _parse_json(resp.text)
         except ValueError as e:
@@ -159,9 +202,14 @@ def _generate_json_with_retry(client: genai.Client, model: str, contents,
     raise last_error  # type: ignore[misc]
 
 
-def _plan_sentences(client: genai.Client, sentences: list[dict], narration_text: str,
+def _plan_sentences(client_or_pool, sentences: list[dict], narration_text: str,
                     style: dict) -> list[dict]:
-    """Stage 1: ask Gemini what each sentence needs to show visually."""
+    """Stage 1: per-sentence visual planning.
+
+    Uses OpenAI GPT when current_openai_key() is set (recommended — spreads load
+    off Gemini and often handles Korean reasoning a bit more reliably);
+    falls back to Gemini text model otherwise.
+    """
     style_signature = style.get("capcut_automation_hints", {}).get("style_signature", "")
     content_template = style.get("content_structure", {}).get("template", "")
 
@@ -208,8 +256,12 @@ JSON만 출력:
   ...
 ]}}
 """
-    print(f"  [Stage 1/2] Planning visuals for {len(sentences)} sentences...")
-    data = _generate_json_with_retry(client, GEMINI_TEXT_MODEL, prompt, label="Stage1")
+    if current_openai_key():
+        print(f"  [Stage 1/2] Planning visuals for {len(sentences)} sentences (OpenAI {OPENAI_TEXT_MODEL})...")
+        data = _plan_with_openai(prompt, label="Stage1")
+    else:
+        print(f"  [Stage 1/2] Planning visuals for {len(sentences)} sentences (Gemini — set OpenAI key to offload)...")
+        data = _generate_json_with_retry(client_or_pool, GEMINI_TEXT_MODEL, prompt, label="Stage1")
     return data.get("plans", [])
 
 
@@ -309,7 +361,7 @@ def _enforce_reuse_cap(paths: list[str], reasons: list[str],
     return new_paths, new_reasons
 
 
-def _assign_clips_for_sentence(client: genai.Client, sentence_idx: int,
+def _assign_clips_for_sentence(pool_or_client, sentence_idx: int,
                                 sentence_text: str, plan: dict,
                                 cuts_in_sentence: list[dict],
                                 candidate_ids: list[str],
@@ -411,7 +463,7 @@ def _assign_clips_for_sentence(client: genai.Client, sentence_idx: int,
             parts.append(types.Part.from_bytes(data=thumb, mime_type="image/jpeg"))
     parts.append(footer)
 
-    data = _generate_json_with_retry(client, GEMINI_TEXT_MODEL, parts,
+    data = _generate_json_with_retry(pool_or_client, GEMINI_TEXT_MODEL, parts,
                                       label=f"S2.sent{sentence_idx}")
     id_to_path = {f"C{i}": candidate_ids[i] for i in range(len(candidate_ids))}
 
@@ -451,7 +503,7 @@ def _safe_int(value, default: int = 0) -> int:
         return default
 
 
-def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[dict],
+def _assign_clips(pool_or_client, cuts: list[dict], sentence_plans: list[dict],
                   clips_analysis: dict[str, ClipAnalysis], style: dict,
                   narration_text: str) -> tuple[list[str], list[str], dict[int, list[dict]]]:
     """Stage 2 per-sentence. Returns (chosen_paths, reasons, ranked_candidates_by_cut)."""
@@ -477,7 +529,7 @@ def _assign_clips(client: genai.Client, cuts: list[dict], sentence_plans: list[d
         print(f"    sentence {sidx}: {len(cuts_in_sent)} cut(s) ← {len(candidates)} candidates")
         try:
             assignments = _assign_clips_for_sentence(
-                client, sidx, sentence_text, plan, cuts_in_sent,
+                pool_or_client, sidx, sentence_text, plan, cuts_in_sent,
                 candidates, clips_analysis, style, narration_text, tmp_dir,
             )
         except Exception as e:
@@ -524,9 +576,12 @@ def match_clips(
     reference_beats: list[dict] | None = None,
 ) -> list[str]:
     """Two-stage matching. Filters unusable clips. Returns clip path per cut."""
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY not set.")
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    if not current_gemini_keys():
+        raise RuntimeError("No Gemini API keys configured. Add at least one in Settings.")
+    pool = KeyPool(current_gemini_keys())
+    print(f"  Gemini key pool size: {len(pool)}")
+    if current_openai_key():
+        print("  OpenAI configured — Stage 1 planner will run on GPT.")
 
     usable = {p: a for p, a in clips_analysis.items() if a.usable}
     skipped = [(p, a) for p, a in clips_analysis.items() if not a.usable]
@@ -553,7 +608,7 @@ def match_clips(
         for i, s in enumerate(sentences)
     ]
 
-    plans = _plan_sentences(client, sentences_payload, narration_text, style)
+    plans = _plan_sentences(pool, sentences_payload, narration_text, style)
 
     ref_by_cut = {b["cut_index"]: b for b in (reference_beats or [])}
 
@@ -584,7 +639,7 @@ def match_clips(
             entry["reference_target_phase"] = ref.get("reference_phase", "")
         cut_entries.append(entry)
 
-    paths, reasons, ranked = _assign_clips(client, cut_entries, plans, usable, style, narration_text)
+    paths, reasons, ranked = _assign_clips(pool, cut_entries, plans, usable, style, narration_text)
     match_clips.last_ranked = ranked  # type: ignore[attr-defined]
     match_clips.last_cut_entries = cut_entries  # type: ignore[attr-defined]
 
