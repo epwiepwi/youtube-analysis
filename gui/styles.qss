@@ -166,7 +166,10 @@ QCheckBox::indicator {
 QCheckBox::indicator:checked {
     background: #4ade80;
     border-color: #4ade80;
-    image: url(:/check.svg);
+}
+
+QCheckBox::indicator:checked:hover {
+    background: #22c55e;
 }
 
 QScrollBar:vertical {
