@@ -1,19 +1,26 @@
-"""Recommendations + interactive HTML viewer for human-in-the-loop editing.
+"""Recommendations + fast-pick HTML viewer for human-in-the-loop editing.
 
-After the matcher runs, we know the top-3 candidate scenes per cut. This
-module extracts thumbnails for every candidate, writes a portable HTML
-viewer that loads them side-by-side, and reads back the user's per-cut
-choices so CapCut can be regenerated with them.
+The viewer's job is to let the user pick the right clip in ~2-3 minutes
+total. Each candidate is shown as an auto-looping muted video preview
+(not a still thumbnail) so action quality is obvious at a glance. Cut
+captions sit above the row of candidates. Number keys 1-5 select a
+candidate, → / Enter / Space advances to the next cut, ← goes back.
+"확정" downloads selections.json and triggers PyQt to regenerate the
+CapCut draft automatically.
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
-from html import escape
 from pathlib import Path
 
 from .vision import ClipAnalysis
+
+
+# Top-N candidates shown per cut. 5 fits cleanly in a row and keeps the
+# total video-preview count under ~80 even for long videos.
+CANDIDATES_PER_CUT = 5
 
 
 def _extract_thumbnail_for_scene(source_file: Path, start: float, end: float,
@@ -30,6 +37,36 @@ def _extract_thumbnail_for_scene(source_file: Path, start: float, end: float,
     )
 
 
+def _extract_preview_video(source_file: Path, start: float, end: float,
+                            out_path: Path) -> None:
+    """Render a small looping preview (240p, no audio, ~3s) for one candidate.
+
+    Auto-playing video makes action quality obvious — a frame that looks
+    fine as a thumbnail might be a hand mid-motion that finishes awkwardly.
+    Capped at 3 seconds so the loop tempo lets the user scan a row of
+    candidates quickly.
+    """
+    if out_path.exists():
+        return
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_dur = max(0.5, end - start)
+    duration = min(raw_dur, 3.0)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-ss", f"{start:.2f}",
+            "-i", str(source_file),
+            "-t", f"{duration:.2f}",
+            "-vf", "scale='min(240,iw)':-2,fps=20",
+            "-an",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+            "-movflags", "+faststart",
+            str(out_path),
+        ],
+        check=True,
+    )
+
+
 def _safe_filename(scene_id: str) -> str:
     return scene_id.replace("#", "_at_").replace("/", "_").replace("\\", "_").replace(" ", "_")
 
@@ -39,22 +76,24 @@ def build_recommendations(
     ranked_by_cut: dict[int, list[dict]],
     clips_analysis: dict[str, ClipAnalysis],
     output_dir: Path,
-    extra_per_cut: int = 7,
+    extra_per_cut: int = CANDIDATES_PER_CUT - 3,
 ) -> tuple[list[dict], list[dict]]:
     """Build per-cut recommendations + a full scene library for browsing.
 
-    Returns (recs, all_scenes).
-    - recs: one entry per cut with up to 3 AI picks + `extra_per_cut` more
-      alternates from the full pool (pre-filter-scored for this cut).
-    - all_scenes: every usable scene with thumbnail + description so the
-      viewer can open a full browse panel.
+    Each cut surfaces up to CANDIDATES_PER_CUT candidates: the AI's top
+    3 picks plus a few heuristic alternates from the rest of the pool.
+    All candidates get a short looping video preview; the full library
+    used by the "browse everything" modal sticks to single thumbnails so
+    the page stays light.
     """
     from .matcher import _score_scene_for_plan  # local import to avoid cycle
 
     thumbs_dir = output_dir / "thumbs"
+    previews_dir = output_dir / "previews"
     thumbs_dir.mkdir(parents=True, exist_ok=True)
+    previews_dir.mkdir(parents=True, exist_ok=True)
 
-    # One-time thumbnail pass for every scene in the pool.
+    # Build the all-scenes library (thumbnails only — used by modal).
     scene_cards: dict[str, dict] = {}
     print(f"  Extracting {len(clips_analysis)} library thumbnails...")
     for sid, a in clips_analysis.items():
@@ -79,14 +118,16 @@ def build_recommendations(
             "thumbnail": thumb_rel,
         }
 
-    recs: list[dict] = []
+    # Collect the set of scenes that actually need a preview video so we
+    # don't render motion previews for the entire library.
+    preview_targets: set[str] = set()
+    recs_skeleton: list[tuple[dict, list[dict]]] = []
     for entry in cut_entries:
         idx = entry["index"]
         picks = ranked_by_cut.get(idx, [])
 
-        # Build the "AI 추천" set (Gemini's top 3).
         ai_picks: list[dict] = []
-        seen_ids: set[str] = set()
+        seen: set[str] = set()
         for rank, p in enumerate(picks[:3]):
             sid = p.get("scene_id")
             if not sid or sid not in scene_cards:
@@ -99,10 +140,9 @@ def build_recommendations(
                 "source": "ai",
             })
             ai_picks.append(card)
-            seen_ids.add(sid)
+            seen.add(sid)
+            preview_targets.add(sid)
 
-        # Heuristically score every remaining scene for this cut using the
-        # sentence's plan (reconstructed from the cut entry's fields).
         plan_surrogate = {
             "visual_intent": entry.get("reference_target_visual", "") or entry.get("owning_sentence_text", ""),
             "required_elements": entry.get("reference_target_elements", []),
@@ -111,10 +151,9 @@ def build_recommendations(
         }
         scored_extras = []
         for sid, a in clips_analysis.items():
-            if sid in seen_ids:
+            if sid in seen:
                 continue
-            score = _score_scene_for_plan(a, plan_surrogate)
-            scored_extras.append((score, sid))
+            scored_extras.append((_score_scene_for_plan(a, plan_surrogate), sid))
         scored_extras.sort(reverse=True)
 
         extras: list[dict] = []
@@ -123,21 +162,44 @@ def build_recommendations(
             card.update({
                 "rank": None,
                 "score": round(score, 1),
-                "reason": "heuristic 대안 (풀 전체에서 추린 추가 후보)",
+                "reason": "heuristic 대안",
                 "source": "heuristic",
             })
             extras.append(card)
+            preview_targets.add(sid)
 
-        candidates = ai_picks + extras
+        recs_skeleton.append((entry, ai_picks + extras))
+
+    # Now render motion previews only for the ~80 candidates we'll show.
+    if preview_targets:
+        print(f"  Rendering {len(preview_targets)} candidate preview videos...")
+    preview_by_sid: dict[str, str] = {}
+    for sid in preview_targets:
+        a = clips_analysis[sid]
+        name = f"{_safe_filename(sid)}.mp4"
+        path = previews_dir / name
+        try:
+            _extract_preview_video(Path(a.source_file), a.start, a.end, path)
+            preview_by_sid[sid] = f"previews/{name}"
+        except Exception as e:
+            preview_by_sid[sid] = ""
+            print(f"    preview failed for {sid}: {e}")
+
+    recs: list[dict] = []
+    for entry, cands in recs_skeleton:
+        for card in cands:
+            card["preview"] = preview_by_sid.get(card["scene_id"], "")
+        idx = entry["index"]
         recs.append({
             "cut_index": idx,
             "time": entry.get("time", ""),
             "phase": entry.get("phase", ""),
             "owning_sentence_index": entry.get("owning_sentence_index"),
             "owning_sentence_text": entry.get("owning_sentence_text", ""),
+            "spoken_here": entry.get("spoken_here", ""),
             "reference_target_visual": entry.get("reference_target_visual", ""),
-            "candidates": candidates,
-            "selected_scene_id": candidates[0]["scene_id"] if candidates else None,
+            "candidates": cands,
+            "selected_scene_id": cands[0]["scene_id"] if cands else None,
         })
 
     all_scenes = list(scene_cards.values())
@@ -160,7 +222,6 @@ def load_selections(output_dir: Path) -> dict[int, str]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
-    # Accept both {cut_0: "id"} and [{cut_index: 0, selected: "id"}] shapes.
     result: dict[int, str] = {}
     if isinstance(data, dict):
         for k, v in data.items():
@@ -182,93 +243,92 @@ _VIEWER_HTML = """<!DOCTYPE html>
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<title>편집 검토 뷰어</title>
+<title>빠른 컷 고르기</title>
 <style>
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, "Segoe UI", sans-serif; background: #111; color: #eee;
-         margin: 0; padding: 24px; }
-  h1 { margin: 0 0 4px; font-size: 20px; }
-  .sub { color: #888; margin-bottom: 24px; font-size: 13px; }
-  .cut { background: #1c1c1c; border-radius: 12px; padding: 16px; margin-bottom: 18px; }
-  .cut header { display: flex; justify-content: space-between; align-items: baseline;
-                margin-bottom: 10px; gap: 12px; flex-wrap: wrap; }
-  .cut header .left { flex: 1; min-width: 0; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px;
-           background: #2a2a2a; color: #bbb; margin-right: 6px; }
-  .sentence { font-size: 14px; color: #ddd; line-height: 1.4; }
-  .time { font-size: 11px; color: #666; margin-left: 6px; }
-  .ref { font-size: 11px; color: #8aa; margin-top: 4px; font-style: italic; }
-  .section-label { font-size: 11px; color: #888; margin: 12px 0 6px; text-transform: uppercase;
-                   letter-spacing: 0.5px; }
-  .cards { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 6px; }
-  .card { flex: 0 0 200px; background: #252525; border-radius: 8px;
-          padding: 10px; cursor: pointer; border: 2px solid transparent;
-          transition: border-color .15s, transform .1s; }
-  .card:hover { border-color: #555; }
-  .card.selected { border-color: #4ade80; background: #1e3a26; }
-  .card.ai .rank { color: #4ade80; font-weight: bold; }
-  .card img { width: 100%; border-radius: 4px; display: block; aspect-ratio: 9/16; object-fit: cover;
-              background: #333; }
-  .rank { font-size: 11px; color: #888; margin-bottom: 4px; }
-  .desc { font-size: 12px; color: #ccc; margin-top: 6px; line-height: 1.35; max-height: 4.5em; overflow: hidden; }
-  .meta { font-size: 10px; color: #777; margin-top: 4px; }
-  .reason { font-size: 11px; color: #aaa; margin-top: 6px; font-style: italic; max-height: 3em; overflow: hidden; }
-  .actions { position: sticky; bottom: 12px; background: #111; padding: 12px 0; z-index: 5;
-             border-top: 1px solid #222; }
-  button { background: #4ade80; color: #000; border: 0; padding: 12px 24px; border-radius: 8px;
-           font-size: 15px; font-weight: bold; cursor: pointer; margin-right: 8px; }
-  button:hover { background: #22c55e; }
-  .browse-btn { background: #3b82f6; color: #fff; padding: 8px 14px; font-size: 12px;
-                margin-top: 8px; }
-  .browse-btn:hover { background: #2563eb; }
-  .help { font-size: 12px; color: #888; margin-top: 8px; }
-  code { background: #222; padding: 2px 6px; border-radius: 3px; color: #eee; }
-  .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 50;
-           display: none; padding: 24px; overflow-y: auto; }
+  body { font-family: -apple-system, "Segoe UI", sans-serif; background: #0a0c10; color: #eee;
+         margin: 0; padding: 0; }
+  .topbar { position: sticky; top: 0; z-index: 20; background: #0a0c10; border-bottom: 1px solid #1f232c;
+            padding: 12px 24px; display: flex; align-items: center; gap: 16px; }
+  .topbar h1 { margin: 0; font-size: 16px; }
+  .topbar .progress { color: #8b93a3; font-size: 13px; }
+  .topbar button { background: #4ade80; color: #0a0c10; border: 0; padding: 10px 20px;
+                   border-radius: 8px; font-weight: 700; font-size: 14px; cursor: pointer; }
+  .topbar button:hover { background: #22c55e; }
+  .topbar button.ghost { background: #1c2029; color: #e6e6e6; }
+  .topbar .keys { font-size: 11px; color: #8b93a3; padding: 4px 8px; background: #1c2029;
+                   border-radius: 6px; }
+  .container { padding: 24px; max-width: 1400px; margin: 0 auto; }
+  .cut { background: #15181f; border-radius: 14px; padding: 18px; margin-bottom: 16px;
+         scroll-margin-top: 80px; border: 2px solid transparent; transition: border-color .15s; }
+  .cut.active { border-color: #4ade80; }
+  .cut.done { opacity: 0.55; }
+  .cut header { margin-bottom: 12px; }
+  .badges { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+  .badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; background: #1c2029; color: #bbb; }
+  .badge.phase { background: #2a2f3c; }
+  .caption-big { font-size: 17px; font-weight: 600; color: #fff; margin: 4px 0 2px; line-height: 1.4; }
+  .caption-spoken { font-size: 13px; color: #4ade80; font-weight: 500; margin-bottom: 2px; }
+  .caption-ref { font-size: 11px; color: #8aa; font-style: italic; }
+  .row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+  .candidate { background: #1c2029; border-radius: 10px; padding: 8px; cursor: pointer;
+               border: 2px solid transparent; position: relative; transition: border-color .15s, transform .1s; }
+  .candidate:hover { border-color: #555; transform: translateY(-1px); }
+  .candidate.selected { border-color: #4ade80; background: #1e3a26; }
+  .candidate video, .candidate img { width: 100%; aspect-ratio: 9/16; object-fit: cover;
+                                       border-radius: 6px; background: #0a0c10; display: block; }
+  .hotkey { position: absolute; top: 4px; left: 4px; background: rgba(0,0,0,.7); color: #fff;
+            border-radius: 4px; padding: 2px 6px; font-size: 11px; font-weight: 700; }
+  .ai-tag { position: absolute; top: 4px; right: 4px; background: rgba(74,222,128,.85); color: #000;
+            border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 700; }
+  .cand-desc { font-size: 11px; color: #ccc; line-height: 1.3; margin-top: 6px; max-height: 3em;
+               overflow: hidden; }
+  .cand-meta { font-size: 10px; color: #777; margin-top: 2px; }
+  .browse-link { color: #8aa; font-size: 12px; cursor: pointer; margin-top: 8px; display: inline-block; }
+  .browse-link:hover { color: #4ade80; }
+  .modal { position: fixed; inset: 0; background: rgba(0,0,0,.9); z-index: 50; display: none;
+           padding: 20px; overflow-y: auto; }
   .modal.open { display: block; }
-  .modal-header { display: flex; justify-content: space-between; align-items: center;
-                  margin-bottom: 16px; }
-  .modal-header h2 { margin: 0; font-size: 18px; }
-  .modal-close { background: #333; color: #fff; padding: 6px 12px; font-size: 12px; }
-  .modal-filter { padding: 10px; background: #1c1c1c; border-radius: 8px; margin-bottom: 12px;
-                  display: flex; gap: 10px; flex-wrap: wrap; }
-  .modal-filter input { background: #222; border: 1px solid #333; color: #eee; padding: 8px 12px;
-                         border-radius: 6px; flex: 1 1 200px; font-size: 13px; }
-  .modal-filter select { background: #222; border: 1px solid #333; color: #eee; padding: 8px 12px;
-                          border-radius: 6px; font-size: 13px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+  .modal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .modal-head input { flex: 1; background: #1c2029; border: 1px solid #2a2f3c; color: #eee;
+                       padding: 8px 12px; border-radius: 6px; margin: 0 12px; }
+  .modal-head button { background: #1c2029; color: #eee; border: 0; padding: 8px 16px;
+                        border-radius: 6px; cursor: pointer; }
+  .modal-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; }
+  .modal-grid .card { background: #1c2029; border-radius: 8px; padding: 8px; cursor: pointer;
+                       border: 2px solid transparent; }
+  .modal-grid .card:hover { border-color: #555; }
+  .modal-grid .card.selected { border-color: #4ade80; }
+  .modal-grid img { width: 100%; aspect-ratio: 9/16; object-fit: cover; border-radius: 4px; }
+  .modal-grid .desc { font-size: 11px; color: #ccc; margin-top: 4px; max-height: 3em; overflow: hidden; }
+  #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+           background: #1e3a26; color: #4ade80; padding: 10px 18px; border-radius: 8px;
+           font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+  #toast.show { opacity: 1; }
 </style>
 </head>
 <body>
-  <h1>편집 검토</h1>
-  <div class="sub">각 컷마다 AI가 3개 추천 + 풀에서 7개 더 추림. "전체 풀에서 고르기"로 모든 장면 볼 수 있음. 썸네일 클릭 → 선택. 하단 "selections.json 저장" 누르고 <code>-UseSelections</code>로 재실행.</div>
-
-  <div id="root"></div>
-
-  <div class="actions">
-    <button id="save">selections.json 다운로드</button>
-    <button id="reset" style="background:#333;color:#eee;">현재 선택 초기화 (모두 AI 1순위로)</button>
-    <div class="help">파일을 <code>output/selections.json</code>에 저장하고 <code>.\\run.ps1 ... -UseSelections</code> 실행.</div>
+  <div class="topbar">
+    <h1>빠른 컷 고르기</h1>
+    <div class="progress" id="progress">0/0 완료</div>
+    <div class="keys">단축키: 1-5 선택 · → 다음 · ← 이전 · Enter 확정</div>
+    <div style="flex:1"></div>
+    <button class="ghost" id="reset">전부 1순위로</button>
+    <button id="confirm">✓ 확정 → CapCut 생성</button>
   </div>
+
+  <div class="container" id="root"></div>
 
   <div class="modal" id="modal">
-    <div class="modal-header">
-      <h2 id="modal-title">전체 풀에서 고르기</h2>
-      <button class="modal-close" id="modal-close">닫기 ✕</button>
+    <div class="modal-head">
+      <button id="modal-close">닫기 ✕</button>
+      <input type="text" id="filter-text" placeholder="설명/태그 검색">
+      <button id="modal-done">선택 안 함</button>
     </div>
-    <div class="modal-filter">
-      <input type="text" id="filter-text" placeholder="설명 또는 태그 검색 (예: 곰팡이, 누름판, 김치)">
-      <select id="filter-file">
-        <option value="">전체 파일</option>
-      </select>
-      <select id="filter-sort">
-        <option value="retention">리텐션 높은순</option>
-        <option value="impact">임팩트 높은순</option>
-        <option value="order">파일 순서</option>
-      </select>
-    </div>
-    <div class="grid" id="modal-grid"></div>
+    <div class="modal-grid" id="modal-grid"></div>
   </div>
+
+  <div id="toast"></div>
 
 <script>
 const DATA = __DATA__;
@@ -277,148 +337,179 @@ const ALL = DATA.all_scenes;
 const selections = {};
 RECS.forEach(c => { selections[c.cut_index] = c.selected_scene_id; });
 
-let activeCutForModal = null;
+let activeIndex = 0;
+let modalCut = null;
+const userPicked = new Set(); // cuts the user explicitly chose
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[c]);
+}
+
+function updateProgress() {
+  document.getElementById('progress').textContent = `${userPicked.size}/${RECS.length} 확정`;
+}
 
 function render() {
   const root = document.getElementById('root');
-  root.innerHTML = RECS.map(cut => {
-    const ai = cut.candidates.filter(c => c.source === 'ai');
-    const extras = cut.candidates.filter(c => c.source !== 'ai');
-    const selectedInCurrent = cut.candidates.some(c => c.scene_id === selections[cut.cut_index]);
-    const selectedFromPool = !selectedInCurrent && selections[cut.cut_index]
-      ? ALL.find(s => s.scene_id === selections[cut.cut_index]) : null;
-
-    const cardHtml = (cand, tag) => {
-      const isSel = selections[cut.cut_index] === cand.scene_id;
-      const rankText = cand.rank ? `${tag} ${cand.rank}순위 · score ${cand.score}` : `${tag} · score ${cand.score}`;
+  root.innerHTML = RECS.map((cut, idx) => {
+    const cards = cut.candidates.slice(0, 5).map((c, ci) => {
+      const isSel = selections[cut.cut_index] === c.scene_id;
+      const tag = c.source === 'ai' ? `<span class="ai-tag">AI #${c.rank || '?'}</span>` : '';
+      const media = c.preview
+        ? `<video src="${c.preview}" autoplay loop muted playsinline preload="metadata"></video>`
+        : (c.thumbnail ? `<img src="${c.thumbnail}" alt="">` : '<div style="aspect-ratio:9/16;background:#222"></div>');
       return `
-        <div class="card ${cand.source === 'ai' ? 'ai' : ''} ${isSel ? 'selected' : ''}"
-             data-cut="${cut.cut_index}" data-scene="${cand.scene_id}">
-          <div class="rank">${rankText}</div>
-          <img src="${cand.thumbnail}" alt="">
-          <div class="desc">${escapeHtml(cand.description)}</div>
-          <div class="meta">${escapeHtml(cand.source_file)} · ${cand.start.toFixed(1)}-${cand.end.toFixed(1)}s · retention ${cand.retention}/10</div>
-          <div class="reason">${escapeHtml(cand.reason || '')}</div>
+        <div class="candidate ${isSel ? 'selected' : ''}" data-cut="${cut.cut_index}" data-scene="${c.scene_id}" data-idx="${ci}">
+          <div class="hotkey">${ci + 1}</div>${tag}
+          ${media}
+          <div class="cand-desc">${escapeHtml(c.description)}</div>
+          <div class="cand-meta">${escapeHtml(c.source_file)} · ${c.start.toFixed(1)}-${c.end.toFixed(1)}s · ret ${c.retention}/10</div>
         </div>
       `;
-    };
-
-    const aiHtml = ai.map(c => cardHtml(c, '🤖 AI')).join('');
-    const extrasHtml = extras.map(c => cardHtml(c, '대안')).join('');
-    const selectedHtml = selectedFromPool ? `
-      <div class="section-label">현재 선택 (풀에서 수동 선택)</div>
-      <div class="cards">
-        <div class="card selected" data-cut="${cut.cut_index}" data-scene="${selectedFromPool.scene_id}">
-          <div class="rank" style="color:#4ade80;">직접 선택</div>
-          <img src="${selectedFromPool.thumbnail}" alt="">
-          <div class="desc">${escapeHtml(selectedFromPool.description)}</div>
-          <div class="meta">${escapeHtml(selectedFromPool.source_file)} · ${selectedFromPool.start.toFixed(1)}-${selectedFromPool.end.toFixed(1)}s</div>
-        </div>
-      </div>` : '';
-
+    }).join('');
+    const done = userPicked.has(cut.cut_index);
     return `
-      <div class="cut">
+      <div class="cut ${idx === activeIndex ? 'active' : ''} ${done ? 'done' : ''}" data-cut-row="${cut.cut_index}" id="cut-${cut.cut_index}">
         <header>
-          <div class="left">
-            <span class="badge">cut ${cut.cut_index}</span>
-            <span class="badge">${cut.phase || ''}</span>
-            <span class="time">${cut.time}</span>
-            <div class="sentence">${escapeHtml(cut.owning_sentence_text)}</div>
-            ${cut.reference_target_visual ? `<div class="ref">🎯 참조: ${escapeHtml(cut.reference_target_visual)}</div>` : ''}
+          <div class="badges">
+            <span class="badge">컷 ${cut.cut_index + 1}/${RECS.length}</span>
+            <span class="badge phase">${cut.phase || ''}</span>
+            <span class="badge">${cut.time || ''}</span>
+            ${done ? '<span class="badge" style="background:#1e3a26;color:#4ade80;">✓ 확정</span>' : ''}
           </div>
+          <div class="caption-big">${escapeHtml(cut.owning_sentence_text)}</div>
+          ${cut.spoken_here && cut.spoken_here !== cut.owning_sentence_text
+            ? `<div class="caption-spoken">▶ "${escapeHtml(cut.spoken_here)}"</div>` : ''}
+          ${cut.reference_target_visual ? `<div class="caption-ref">🎯 참조: ${escapeHtml(cut.reference_target_visual)}</div>` : ''}
         </header>
-        ${selectedHtml}
-        <div class="section-label">🤖 AI 추천 (Top 3)</div>
-        <div class="cards">${aiHtml}</div>
-        <div class="section-label">📎 유사 대안 (풀에서 자동 추림)</div>
-        <div class="cards">${extrasHtml}</div>
-        <button class="browse-btn" data-open-pool="${cut.cut_index}">이 컷에 쓸 장면 전체 풀에서 고르기</button>
+        <div class="row">${cards}</div>
+        <a class="browse-link" data-open-pool="${cut.cut_index}">전체 풀에서 직접 고르기 →</a>
       </div>
     `;
   }).join('');
 
-  document.querySelectorAll('.card').forEach(el => {
+  document.querySelectorAll('.candidate').forEach(el => {
     el.addEventListener('click', () => {
-      selections[el.dataset.cut] = el.dataset.scene;
-      render();
+      const cutIdx = Number(el.dataset.cut);
+      pickFor(cutIdx, el.dataset.scene, true);
     });
   });
-  document.querySelectorAll('[data-open-pool]').forEach(btn => {
-    btn.addEventListener('click', () => openModal(Number(btn.dataset.openPool)));
+  document.querySelectorAll('[data-open-pool]').forEach(el => {
+    el.addEventListener('click', () => openModal(Number(el.dataset.openPool)));
   });
+  updateProgress();
 }
 
-function escapeHtml(s) {
-  return String(s || '').replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  })[c]);
+function pickFor(cutIdx, sceneId, advance) {
+  selections[cutIdx] = sceneId;
+  userPicked.add(cutIdx);
+  render();
+  if (advance) {
+    setTimeout(() => goNext(), 120);
+  }
 }
+
+function goToIndex(i) {
+  if (i < 0 || i >= RECS.length) return;
+  activeIndex = i;
+  const cut = RECS[i];
+  const el = document.getElementById('cut-' + cut.cut_index);
+  if (el) {
+    el.scrollIntoView({behavior: 'smooth', block: 'start'});
+    document.querySelectorAll('.cut').forEach(c => c.classList.remove('active'));
+    el.classList.add('active');
+  }
+}
+
+function goNext() {
+  if (activeIndex < RECS.length - 1) goToIndex(activeIndex + 1);
+}
+
+function goPrev() {
+  if (activeIndex > 0) goToIndex(activeIndex - 1);
+}
+
+document.addEventListener('keydown', e => {
+  if (document.getElementById('modal').classList.contains('open')) return;
+  if (e.target.tagName === 'INPUT') return;
+  const cut = RECS[activeIndex];
+  if (!cut) return;
+  if (e.key >= '1' && e.key <= '5') {
+    const ci = parseInt(e.key, 10) - 1;
+    const cand = cut.candidates[ci];
+    if (cand) {
+      e.preventDefault();
+      pickFor(cut.cut_index, cand.scene_id, true);
+    }
+  } else if (e.key === 'ArrowRight' || e.key === ' ') {
+    e.preventDefault();
+    goNext();
+  } else if (e.key === 'ArrowLeft') {
+    e.preventDefault();
+    goPrev();
+  } else if (e.key === 'Enter') {
+    if (userPicked.size === RECS.length) {
+      e.preventDefault();
+      confirmAll();
+    } else {
+      e.preventDefault();
+      goNext();
+    }
+  }
+});
 
 function openModal(cutIdx) {
-  activeCutForModal = cutIdx;
-  const cut = RECS.find(c => c.cut_index === cutIdx);
-  document.getElementById('modal-title').textContent = `cut ${cutIdx} 장면 고르기 — "${cut.owning_sentence_text}"`;
-  populateFilters();
-  renderModalGrid();
+  modalCut = cutIdx;
+  renderModal();
   document.getElementById('modal').classList.add('open');
 }
 
-function populateFilters() {
-  const sel = document.getElementById('filter-file');
-  const current = sel.value;
-  const files = [...new Set(ALL.map(s => s.source_file))].sort();
-  sel.innerHTML = '<option value="">전체 파일</option>' +
-    files.map(f => `<option value="${escapeHtml(f)}">${escapeHtml(f)}</option>`).join('');
-  sel.value = current;
-}
-
-function renderModalGrid() {
-  const text = document.getElementById('filter-text').value.toLowerCase().trim();
-  const file = document.getElementById('filter-file').value;
-  const sort = document.getElementById('filter-sort').value;
-  let list = ALL.slice();
-  if (text) {
-    list = list.filter(s => {
-      const hay = (s.description + ' ' + (s.tags || []).join(' ')).toLowerCase();
-      return hay.includes(text);
-    });
+function renderModal() {
+  const filter = document.getElementById('filter-text').value.toLowerCase().trim();
+  let list = ALL;
+  if (filter) {
+    list = list.filter(s => (s.description + ' ' + (s.tags || []).join(' ')).toLowerCase().includes(filter));
   }
-  if (file) list = list.filter(s => s.source_file === file);
-  if (sort === 'retention') list.sort((a,b) => b.retention - a.retention);
-  else if (sort === 'impact') list.sort((a,b) => b.visual_impact - a.visual_impact);
-  else list.sort((a,b) => a.source_file.localeCompare(b.source_file) || a.start - b.start);
-
   const grid = document.getElementById('modal-grid');
   grid.innerHTML = list.map(s => {
-    const isSel = selections[activeCutForModal] === s.scene_id;
+    const isSel = selections[modalCut] === s.scene_id;
     return `
       <div class="card ${isSel ? 'selected' : ''}" data-modal-scene="${s.scene_id}">
-        <div class="rank">retention ${s.retention}/10 · impact ${s.visual_impact}/10</div>
         <img src="${s.thumbnail}" alt="">
         <div class="desc">${escapeHtml(s.description)}</div>
-        <div class="meta">${escapeHtml(s.source_file)} · ${s.start.toFixed(1)}-${s.end.toFixed(1)}s</div>
+        <div class="cand-meta">${escapeHtml(s.source_file)} · ${s.start.toFixed(1)}-${s.end.toFixed(1)}s</div>
       </div>
     `;
   }).join('');
   grid.querySelectorAll('[data-modal-scene]').forEach(el => {
     el.addEventListener('click', () => {
-      selections[activeCutForModal] = el.dataset.modalScene;
+      pickFor(modalCut, el.dataset.modalScene, true);
       closeModal();
-      render();
     });
   });
 }
 
 document.getElementById('modal-close').addEventListener('click', closeModal);
+document.getElementById('modal-done').addEventListener('click', closeModal);
+document.getElementById('filter-text').addEventListener('input', renderModal);
 function closeModal() {
   document.getElementById('modal').classList.remove('open');
-  activeCutForModal = null;
+  modalCut = null;
 }
-['filter-text', 'filter-file', 'filter-sort'].forEach(id => {
-  document.getElementById(id).addEventListener('input', renderModalGrid);
-});
 
-document.getElementById('save').addEventListener('click', () => {
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 1800);
+}
+
+function confirmAll() {
+  // Mark every cut as picked when the user confirms (covers ones they
+  // skipped — they're implicitly accepting AI #1 for those).
+  RECS.forEach(c => userPicked.add(c.cut_index));
   const payload = {};
   Object.entries(selections).forEach(([k, v]) => { payload[`cut_${k}`] = v; });
   const blob = new Blob([JSON.stringify(payload, null, 2)], {type: 'application/json'});
@@ -426,14 +517,18 @@ document.getElementById('save').addEventListener('click', () => {
   a.href = URL.createObjectURL(blob);
   a.download = 'selections.json';
   a.click();
-});
+  showToast('확정! CapCut 재생성 시작합니다...');
+}
 
+document.getElementById('confirm').addEventListener('click', confirmAll);
 document.getElementById('reset').addEventListener('click', () => {
   RECS.forEach(c => { selections[c.cut_index] = c.selected_scene_id; });
+  userPicked.clear();
   render();
 });
 
 render();
+goToIndex(0);
 </script>
 </body>
 </html>"""

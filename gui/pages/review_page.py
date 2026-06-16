@@ -83,10 +83,16 @@ class ReviewPage(QWidget):
         state = request.state()
         if state == QWebEngineDownloadRequest.DownloadState.DownloadCompleted:
             saved = Path(request.downloadDirectory()) / request.downloadFileName()
-            QMessageBox.information(
-                self, "selections.json 저장됨",
-                f"저장 위치: {saved}\n\n이제 상단의 '선택대로 CapCut 재생성' 버튼을 누르세요.",
-            )
+            # Auto-trigger regeneration as soon as the user hits 확정 in the
+            # viewer. The browser's download = the user's confirm action,
+            # so there's no second-step "click regenerate" needed.
+            if saved.name == "selections.json" and self._on_regenerate:
+                self._on_regenerate()
+            else:
+                QMessageBox.information(
+                    self, "저장됨",
+                    f"저장 위치: {saved}",
+                )
         elif state == QWebEngineDownloadRequest.DownloadState.DownloadInterrupted:
             QMessageBox.warning(self, "다운로드 실패", "selections.json 저장에 실패했어요.")
 
