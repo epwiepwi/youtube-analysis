@@ -125,13 +125,25 @@ def _canvas_material() -> dict:
 
 
 def _video_segment(material_id: str, canvas_id: str, seg: VideoSegment) -> dict:
+    # When speed != 1.0 the source consumed equals scene_duration; the
+    # timeline space taken equals scene_duration / speed. CapCut needs
+    # both to agree, so derive source_duration from the segment's speed
+    # rather than trusting source_end - source_start naively.
+    timeline_duration_s = seg.timeline_end - seg.timeline_start
+    source_duration_s = max(0.001, timeline_duration_s * seg.speed)
     return {
         "id": new_id(),
         "material_id": material_id,
-        "source_timerange": {"start": us(seg.source_start), "duration": us(seg.source_end - seg.source_start)},
-        "target_timerange": {"start": us(seg.timeline_start), "duration": us(seg.timeline_end - seg.timeline_start)},
+        "source_timerange": {
+            "start": us(seg.source_start),
+            "duration": us(source_duration_s),
+        },
+        "target_timerange": {
+            "start": us(seg.timeline_start),
+            "duration": us(timeline_duration_s),
+        },
         "extra_material_refs": [canvas_id],
-        "speed": 1.0,
+        "speed": float(seg.speed),
         "volume": 1.0,
         "visible": True,
         "clip": {

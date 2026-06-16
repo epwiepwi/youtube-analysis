@@ -37,6 +37,7 @@ class VideoSegment:
     source_end: float
     timeline_start: float
     timeline_end: float
+    speed: float = 1.0
 
 
 @dataclass
@@ -154,44 +155,89 @@ def load_clips(clip_dir: Path) -> list[Clip]:
 
 
 def compute_cut_points(transcript: Transcript, style: dict) -> list[float]:
+    """Choose cut points based on the speaker's natural pauses, not a clock.
+
+    The old logic targeted ``cursor + avg_cut`` every iteration and snapped
+    to the nearest word end, which routinely cut mid-sentence because the
+    fixed cadence didn't care about meaning. Real짜집기 편집자는 호흡 끊기는
+    지점에서 자른다 — so we collect every silence gap between consecutive
+    words (a "breath"), then pick breaths inside the [shortest, longest]
+    window from the previous cut, preferring the strongest (longest) pause
+    closest to the average target. Only when no breath exists in range do
+    we fall back to a forced cut at the latest word boundary.
+    """
     pacing = style.get("pacing", {})
     avg_cut = float(pacing.get("avg_cut_length_sec", 1.5))
-    shortest = float(pacing.get("shortest_cut_sec", 1.0))
-    longest = float(pacing.get("longest_cut_sec", 3.0))
+    shortest = float(pacing.get("shortest_cut_sec", 0.8))
+    longest = float(pacing.get("longest_cut_sec", 3.5))
+    breath_threshold = float(pacing.get("breath_threshold_sec", 0.15))
 
     total = transcript.duration
-    points: list[float] = [0.0]
     words = transcript.words
     if not words:
         return [0.0, total]
 
-    cursor = 0.0
-    i = 0
-    while cursor < total and i < len(words):
-        target = cursor + avg_cut
-        best_idx = i
-        best_diff = float("inf")
-        j = i
-        while j < len(words) and words[j].end <= cursor + longest:
-            if words[j].end <= cursor + shortest:
-                j += 1
-                continue
-            diff = abs(words[j].end - target)
-            if diff < best_diff:
-                best_diff = diff
-                best_idx = j
-            j += 1
-        if best_idx == i and words[i].end <= cursor + shortest:
-            best_idx = min(j, len(words) - 1)
-        cut_time = words[best_idx].end
-        if cut_time - cursor < shortest:
-            cut_time = cursor + shortest
-        if cut_time > total:
+    # Collect every speaker pause between consecutive words.
+    # Each "breath" carries its strength (gap length) so longer pauses
+    # — sentence-ish boundaries — win ties.
+    breaths: list[tuple[float, float]] = []
+    for prev, curr in zip(words, words[1:]):
+        gap = curr.start - prev.end
+        if gap >= breath_threshold:
+            breaths.append((prev.end, gap))
+
+    points: list[float] = [0.0]
+    breath_idx = 0
+
+    while points[-1] < total:
+        last = points[-1]
+        target_min = last + shortest
+        target_max = last + longest
+        if target_min >= total:
+            break
+
+        # Advance past breaths that are too early to count.
+        while breath_idx < len(breaths) and breaths[breath_idx][0] < target_min:
+            breath_idx += 1
+
+        # Gather breaths inside the legal window.
+        candidates: list[tuple[float, float]] = []
+        i = breath_idx
+        while i < len(breaths) and breaths[i][0] <= target_max:
+            candidates.append(breaths[i])
+            i += 1
+
+        cut_time: float | None = None
+        if candidates:
+            # Pick the breath that combines a strong pause with proximity
+            # to the style profile's average cut length. Heavily weight gap
+            # strength; lightly penalize distance from the soft target.
+            target = last + avg_cut
+            cut_time = max(
+                candidates,
+                key=lambda b: b[1] * 4.0 - abs(b[0] - target),
+            )[0]
+        else:
+            # No breath in window — cut at the latest legal word boundary.
+            forced = [
+                w.end for w in words
+                if target_min <= w.end <= target_max
+            ]
+            if forced:
+                cut_time = max(forced)
+
+        if cut_time is None:
+            # Truly nothing in range. Cap at the next word end after last+shortest
+            # so we still progress, even if it pushes a bit past longest.
+            next_word_end = next((w.end for w in words if w.end > target_min), total)
+            cut_time = min(next_word_end, total)
+
+        cut_time = min(cut_time, total)
+        if cut_time <= last + 1e-3:
             break
         points.append(round(cut_time, 3))
-        cursor = cut_time
-        i = best_idx + 1
-    if points[-1] < total:
+
+    if points[-1] < total - 0.05:
         points.append(round(total, 3))
     return points
 
@@ -255,40 +301,101 @@ def build_captions(transcript: Transcript, style: dict) -> list[CaptionSegment]:
     return out
 
 
-def assign_clips_by_ids(cut_points: list[float], ids: list[str], clips: list[Clip]) -> list[VideoSegment]:
-    """Build VideoSegment list using explicit scene id per cut (from semantic matcher).
+def assign_clips_by_ids(
+    cut_points: list[float],
+    ids: list[str],
+    clips: list[Clip],
+    ranked_by_cut: dict[int, list[dict]] | None = None,
+    speed_min: float = 0.7,
+    speed_max: float = 1.5,
+) -> list[VideoSegment]:
+    """Build VideoSegments from per-cut scene ids, fitting clips by speed.
 
-    Each id is a Clip.id (file#start-end). source_start/end in the resulting
-    VideoSegment are absolute timestamps inside the source file.
+    Old code truncated long clips (src_end = src_start + needed) which threw
+    away most of the chosen scene and often left a slow, half-finished
+    motion in the cut. Real editors stretch/compress the clip's playback
+    speed to match the cut length instead — that preserves the whole
+    chosen moment.
+
+    For each cut we compute the required speed = clip.duration / needed.
+    If it falls inside [speed_min, speed_max], we keep the entire scene
+    and write `speed` into the segment so CapCut plays it back at that
+    rate. If it's outside the range (clip too long-or-too-short to feel
+    natural at any reasonable speed), we walk down the ranked candidate
+    list for that cut and try the next picks. As a last resort we fall
+    back to the original truncation behavior so we never end up with no
+    segment at all.
     """
     by_id = {c.id: c for c in clips}
     segments: list[VideoSegment] = []
     revisit: dict[str, int] = {}
+
+    def speed_in_range(clip: Clip, needed: float) -> float | None:
+        if needed <= 0 or clip.duration <= 0:
+            return None
+        speed = clip.duration / needed
+        if speed_min <= speed <= speed_max:
+            return round(speed, 4)
+        return None
+
     for idx in range(len(cut_points) - 1):
         t_start = cut_points[idx]
         t_end = cut_points[idx + 1]
         needed = t_end - t_start
-        scene_id = ids[idx]
-        clip = by_id.get(scene_id) or clips[idx % len(clips)]
-        visits = revisit.get(clip.id, 0)
-        revisit[clip.id] = visits + 1
+        primary_id = ids[idx]
 
-        if clip.duration <= needed:
-            src_start = clip.start
-            src_end = clip.end
-        else:
-            slack = clip.duration - needed
-            offset = min(slack, visits * (slack / 3) + slack * 0.1)
-            src_start = clip.start + offset
-            src_end = src_start + needed
+        # Build the ordered list of clips to try for this cut: the matcher's
+        # top pick first, then alternates from the ranked list.
+        tried_ids: list[str] = [primary_id]
+        if ranked_by_cut and idx in ranked_by_cut:
+            for pick in ranked_by_cut[idx]:
+                sid = pick.get("scene_id")
+                if sid and sid not in tried_ids and sid in by_id:
+                    tried_ids.append(sid)
 
-        segments.append(VideoSegment(
-            clip=clip,
-            source_start=round(src_start, 3),
-            source_end=round(src_end, 3),
-            timeline_start=round(t_start, 3),
-            timeline_end=round(t_end, 3),
-        ))
+        chosen: VideoSegment | None = None
+        for sid in tried_ids:
+            clip = by_id.get(sid)
+            if not clip:
+                continue
+            speed = speed_in_range(clip, needed)
+            if speed is None:
+                continue
+            # Use the entire scene; CapCut will play it back at `speed`.
+            chosen = VideoSegment(
+                clip=clip,
+                source_start=round(clip.start, 3),
+                source_end=round(clip.end, 3),
+                timeline_start=round(t_start, 3),
+                timeline_end=round(t_end, 3),
+                speed=speed,
+            )
+            break
+
+        if chosen is None:
+            # Fallback: every candidate was outside speed range. Truncate
+            # the primary pick so the timeline still has a clip there.
+            clip = by_id.get(primary_id) or clips[idx % len(clips)]
+            visits = revisit.get(clip.id, 0)
+            revisit[clip.id] = visits + 1
+            if clip.duration <= needed:
+                src_start = clip.start
+                src_end = clip.end
+            else:
+                slack = clip.duration - needed
+                offset = min(slack, visits * (slack / 3) + slack * 0.1)
+                src_start = clip.start + offset
+                src_end = src_start + needed
+            chosen = VideoSegment(
+                clip=clip,
+                source_start=round(src_start, 3),
+                source_end=round(src_end, 3),
+                timeline_start=round(t_start, 3),
+                timeline_end=round(t_end, 3),
+                speed=1.0,
+            )
+
+        segments.append(chosen)
     return segments
 
 
@@ -427,7 +534,13 @@ def build_plan(
                     save_recommendations(recs, all_scenes, output_dir)
                     viewer = write_viewer_html(recs, all_scenes, output_dir)
                     print(f"  -> open {viewer} to review and pick alternates")
-        segments = assign_clips_by_ids(cut_points, scene_ids, clips)
+        # Pass the ranked candidate list so speed-fitting can fall back
+        # to the next pick when the primary clip is too long/short.
+        from .matcher import match_clips as _mc_for_ranked
+        ranked_for_fitting = getattr(_mc_for_ranked, "last_ranked", None)
+        segments = assign_clips_by_ids(
+            cut_points, scene_ids, clips, ranked_by_cut=ranked_for_fitting,
+        )
     else:
         segments = assign_clips_to_cuts(cut_points, clips)
 

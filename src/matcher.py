@@ -140,6 +140,33 @@ def _extract_thumbnail(source_file: Path, scene_start: float, scene_end: float,
     return out
 
 
+def _extract_scene_frames(source_file: Path, scene_start: float, scene_end: float,
+                          tmp_dir: Path, slug: str, count: int = 3) -> list[Path]:
+    """Pull `count` evenly-spaced frames from inside the scene range.
+
+    Single-frame thumbnails miss mid-action moments — a clip that's
+    "putting on a lid" can look like "static hand" from one frame. Three
+    frames let the matcher see the action's arc and reject candidates
+    where the motion is awkward or cut off.
+    """
+    duration = max(0.5, scene_end - scene_start)
+    frames: list[Path] = []
+    for i in range(count):
+        t = scene_start + duration * (i + 1) / (count + 1)
+        out = tmp_dir / f"{slug}_f{i}.jpg"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.2f}",
+                 "-i", str(source_file), "-frames:v", "1", "-vf", "scale=320:-1",
+                 "-q:v", "6", str(out)],
+                check=True,
+            )
+            frames.append(out)
+        except subprocess.CalledProcessError:
+            continue
+    return frames
+
+
 def _plan_with_openai(prompt: str, label: str = "Stage1") -> dict:
     """Use OpenAI GPT for the Stage 1 text planner.
 
@@ -374,16 +401,21 @@ def _assign_clips_for_sentence(pool_or_client, sentence_idx: int,
     """
     style_signature = style.get("capcut_automation_hints", {}).get("style_signature", "")
 
-    thumbnails: list[bytes] = []
+    # Pull 3 evenly-spaced frames per candidate so the matcher sees how
+    # the action evolves, not just a single mid-clip thumbnail. This
+    # mirrors how Stage-0 vision analyzed the scene, so the picker can
+    # actually verify the description before committing.
+    frames_per_candidate: list[list[bytes]] = []
     for i, sid in enumerate(candidate_ids):
         a = clips_analysis[sid]
         try:
-            thumb = _extract_thumbnail(
-                Path(a.source_file), a.start, a.end, tmp_dir, slug=f"s{sentence_idx}_c{i}"
+            frame_paths = _extract_scene_frames(
+                Path(a.source_file), a.start, a.end, tmp_dir,
+                slug=f"s{sentence_idx}_c{i}", count=3,
             )
-            thumbnails.append(thumb.read_bytes())
+            frames_per_candidate.append([fp.read_bytes() for fp in frame_paths])
         except Exception:
-            thumbnails.append(b"")
+            frames_per_candidate.append([])
 
     header = f"""너는 짜집기 쇼츠 편집자다. 한 문장에 속한 컷들에 클립을 배정한다.
 
@@ -444,7 +476,9 @@ def _assign_clips_for_sentence(pool_or_client, sentence_idx: int,
 
     footer = """
 
-각 컷에 **상위 3개 후보**를 배정해 JSON으로만 출력. reason에는 (1) 컷의 visual_intent (2) 썸네일에 실제로 보이는 시각 요소 (3) 둘이 어떻게 일치하는지 명시.
+각 클립에는 3개의 프레임(씬 시작/중간/끝)이 함께 첨부됐다. 세 장을 한 묶음으로 보고 "동작이 자연스러운지", "중요한 순간이 잘리지 않았는지"까지 판단해라. 가운데 한 장만 좋아 보이고 시작/끝 프레임에서 동작이 어색하면 그 클립은 감점.
+
+각 컷에 **상위 3개 후보**를 배정해 JSON으로만 출력. reason에는 (1) 컷의 visual_intent (2) 첨부 프레임들에서 실제로 보이는 동작/시각 요소 (3) 둘이 어떻게 일치하는지 명시.
 2순위/3순위는 1순위가 왜 선택됐는지와 비교해 "대안"이 되어야 한다 (완전히 다른 느낌 말고, 비슷하게 괜찮은 옵션).
 
 {"assignments": [
@@ -457,10 +491,15 @@ def _assign_clips_for_sentence(pool_or_client, sentence_idx: int,
 ]}
 """
     parts: list = [header]
-    for i, (sid, thumb) in enumerate(zip(candidate_ids, thumbnails)):
-        parts.append(f"[C{i} 썸네일:]")
-        if thumb:
-            parts.append(types.Part.from_bytes(data=thumb, mime_type="image/jpeg"))
+    for i, (sid, frames) in enumerate(zip(candidate_ids, frames_per_candidate)):
+        # Attach all 3 frames for this candidate so the model sees the
+        # motion arc instead of guessing from a single mid-clip thumb.
+        if frames:
+            parts.append(f"[C{i} 프레임 (씬 시작→끝 순서, 동작이 자연스러운지 확인):]")
+            for fb in frames:
+                parts.append(types.Part.from_bytes(data=fb, mime_type="image/jpeg"))
+        else:
+            parts.append(f"[C{i} 프레임 없음 — desc/tags만으로 판단]")
     parts.append(footer)
 
     data = _generate_json_with_retry(pool_or_client, GEMINI_TEXT_MODEL, parts,
