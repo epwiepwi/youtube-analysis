@@ -2,6 +2,7 @@
 REM Shorts Editor — one-shot build. Run on Windows. Produces:
 REM   dist\ShortsEditor\ShortsEditor.exe   (PyInstaller bundle)
 REM   dist\ShortsEditor-Setup.exe          (Inno Setup installer, if iscc found)
+chcp 65001 >nul
 setlocal enableextensions
 cd /d "%~dp0"
 
@@ -26,7 +27,7 @@ if not exist "vendor\ffmpeg\ffmpeg.exe" (
     echo Downloading ffmpeg release essentials...
     powershell -NoProfile -Command "Invoke-WebRequest -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile 'vendor\ffmpeg.zip'"
     if errorlevel 1 (
-        echo ffmpeg 다운로드 실패. 수동으로 ffmpeg.exe, ffprobe.exe를 vendor\ffmpeg\에 넣고 다시 실행하세요.
+        echo ffmpeg download failed. Put ffmpeg.exe and ffprobe.exe under vendor\ffmpeg\ manually and rerun.
         pause
         exit /b 1
     )
@@ -45,7 +46,7 @@ if exist "build" rmdir /s /q build
 if exist "dist\ShortsEditor" rmdir /s /q "dist\ShortsEditor"
 python -m PyInstaller --noconfirm --clean app.spec
 if errorlevel 1 (
-    echo PyInstaller build 실패. 위 로그를 확인하세요.
+    echo PyInstaller build failed. See log above.
     pause
     exit /b 1
 )
@@ -63,18 +64,18 @@ if not errorlevel 1 (
 if defined ISCC_EXE (
     "%ISCC_EXE%" installer.iss
     if errorlevel 1 (
-        echo 설치 프로그램 빌드 실패. installer.iss 로그 확인.
+        echo Inno Setup compile failed. Check installer.iss log above.
         pause
         exit /b 1
     )
     echo.
     echo ==================================================
-    echo  설치 프로그램 완성: dist\ShortsEditor-Setup.exe
+    echo  Installer ready: dist\ShortsEditor-Setup.exe
     echo ==================================================
 ) else (
-    echo Inno Setup이 설치되어 있지 않습니다. https://jrsoftware.org/isdl.php 에서 받은 뒤
-    echo 다시 build.bat 실행 또는 iscc installer.iss 수동 실행하세요.
-    echo 현재까지 결과: dist\ShortsEditor\ShortsEditor.exe 폴더 그대로 배포 가능.
+    echo Inno Setup is not installed.
+    echo Get it from https://jrsoftware.org/isdl.php and rerun build.bat.
+    echo For now you can still ship the folder: dist\ShortsEditor\
 )
 
 pause
