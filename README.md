@@ -48,3 +48,20 @@ python -m src.main `
 - 톤업 컬러 필터 자동 적용 (CapCut `video_effects` 삽입)
 - 이모지 자동 삽입 (부정/경고 어절 감지 시 ❌ 삽입)
 - 썸네일 자동 생성
+
+## 데스크탑 앱 빌드 (Windows .exe + 설치 프로그램)
+
+본인이 직접 쓰거나 다른 사람한테 배포할 .exe 만드는 방법:
+
+1. Windows에서 이 폴더 열고:
+   ```
+   build.bat
+   ```
+2. 자동으로:
+   - PyInstaller 설치
+   - ffmpeg 다운로드 (vendor/ffmpeg/)
+   - dist\ShortsEditor\ 에 폴더 형태 .exe 빌드
+   - Inno Setup 설치돼 있으면 dist\ShortsEditor-Setup.exe 까지 생성
+
+설치 프로그램까지 만들려면 Inno Setup 무료 설치: https://jrsoftware.org/isdl.php
+설치 안 해도 `dist\ShortsEditor` 폴더 통째로 ZIP해서 배포 가능.
