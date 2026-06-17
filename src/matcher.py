@@ -559,7 +559,15 @@ def _assign_clips(pool_or_client, cuts: list[dict], sentence_plans: list[dict],
         sidx = c.get("owning_sentence_index")
         cuts_by_sent.setdefault(sidx, []).append(c)
 
-    for sidx, cuts_in_sent in cuts_by_sent.items():
+    # Run per-sentence matching in parallel — each sentence's prompt is
+    # independent of the others, so there's no benefit to processing them
+    # sequentially. With the key pool rotating across keys, this also
+    # spreads load over multiple Gemini quotas.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import os as _os
+    matcher_concurrency = int(_os.environ.get("MATCHER_CONCURRENCY", "5"))
+
+    def run_sentence(sidx: int, cuts_in_sent: list[dict]) -> tuple[int, dict]:
         plan = plans_by_sent.get(sidx, {})
         sentence_text = next(
             (p.get("text", "") for p in sentence_plans if p["sentence_index"] == sidx), ""
@@ -567,14 +575,22 @@ def _assign_clips(pool_or_client, cuts: list[dict], sentence_plans: list[dict],
         candidates = _prefilter_for_sentence(plan, clips_analysis, top_k=20)
         print(f"    sentence {sidx}: {len(cuts_in_sent)} cut(s) ← {len(candidates)} candidates")
         try:
-            assignments = _assign_clips_for_sentence(
+            return sidx, _assign_clips_for_sentence(
                 pool_or_client, sidx, sentence_text, plan, cuts_in_sent,
                 candidates, clips_analysis, style, narration_text, tmp_dir,
             )
         except Exception as e:
             print(f"    sentence {sidx} FAILED: {e}")
-            assignments = {}
-        ranked_by_cut.update(assignments)
+            return sidx, {}
+
+    with ThreadPoolExecutor(max_workers=matcher_concurrency) as executor:
+        futures = [
+            executor.submit(run_sentence, sidx, cuts_in_sent)
+            for sidx, cuts_in_sent in cuts_by_sent.items()
+        ]
+        for fut in as_completed(futures):
+            _, assignments = fut.result()
+            ranked_by_cut.update(assignments)
 
     for f in tmp_dir.glob("*"):
         f.unlink(missing_ok=True)
