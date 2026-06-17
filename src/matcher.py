@@ -542,6 +542,68 @@ def _safe_int(value, default: int = 0) -> int:
         return default
 
 
+def _diversify_candidates(
+    ranked_by_cut: dict[int, list[dict]],
+    num_cuts: int,
+    clips_analysis: dict[str, ClipAnalysis],
+    max_per_file: int = 2,
+    recent_window: int = 3,
+) -> dict[int, list[dict]]:
+    """Reorder each cut's ranked candidates for cross-cut source diversity.
+
+    Per-sentence matching runs independently, so multiple consecutive cuts
+    happily pick near-identical scenes from the same long source file. This
+    greedy pass walks the cuts in order and, for each, re-sorts its
+    candidates by:
+
+      effective_score = matcher_score
+                        - 100 if this clip's source file appeared in the
+                          last `recent_window` chosen cuts   (kills runs)
+                        - 25 * (times the file was used so far) once the
+                          file has already hit `max_per_file`  (spreads use)
+
+    Then the top of the re-sorted list becomes the default pick for that
+    cut. The full candidate list is preserved (just reordered) so the
+    viewer still shows every alternative.
+    """
+    def file_of(scene_id: str) -> str:
+        a = clips_analysis.get(scene_id)
+        return str(a.source_file) if a else scene_id.split("#")[0]
+
+    file_use: dict[str, int] = {}
+    recent_files: list[str] = []
+    out: dict[int, list[dict]] = {}
+
+    for i in range(num_cuts):
+        picks = list(ranked_by_cut.get(i, []))
+        if not picks:
+            out[i] = picks
+            continue
+
+        def effective(p: dict) -> float:
+            sid = p.get("scene_id", "")
+            f = file_of(sid)
+            score = float(p.get("score", 0) or 0)
+            penalty = 0.0
+            if f in recent_files:
+                penalty += 100.0
+            used = file_use.get(f, 0)
+            if used >= max_per_file:
+                penalty += 25.0 * (used - max_per_file + 1)
+            return score - penalty
+
+        reordered = sorted(picks, key=effective, reverse=True)
+        out[i] = reordered
+
+        chosen_file = file_of(reordered[0].get("scene_id", ""))
+        file_use[chosen_file] = file_use.get(chosen_file, 0) + 1
+        recent_files.append(chosen_file)
+        if len(recent_files) > recent_window:
+            recent_files.pop(0)
+
+    return out
+
+
 def _assign_clips(pool_or_client, cuts: list[dict], sentence_plans: list[dict],
                   clips_analysis: dict[str, ClipAnalysis], style: dict,
                   narration_text: str) -> tuple[list[str], list[str], dict[int, list[dict]]]:
@@ -599,6 +661,18 @@ def _assign_clips(pool_or_client, cuts: list[dict], sentence_plans: list[dict],
     except OSError:
         pass
 
+    # Global diversity pass: reorder each cut's candidate list so the
+    # default (top) pick avoids source files already used — especially
+    # in the last few cuts. This fixes the "same footage for 10 seconds"
+    # problem where independent per-sentence matching kept picking
+    # near-identical scenes from one long source file. The reordered
+    # candidates also feed the viewer, so its default selection is
+    # already diverse and the user can just hit 확정.
+    ranked_by_cut = _diversify_candidates(
+        ranked_by_cut, len(cuts), clips_analysis,
+        max_per_file=2, recent_window=3,
+    )
+
     result_paths: list[str] = []
     result_reasons: list[str] = []
     for i in range(len(cuts)):
@@ -612,11 +686,6 @@ def _assign_clips(pool_or_client, cuts: list[dict], sentence_plans: list[dict],
             result_paths.append(top["scene_id"])
             result_reasons.append(f"[score={top['score']}] {top['reason']}")
 
-    # Hard reuse cap as a safety net for when Gemini ignores the rule.
-    result_paths, result_reasons = _enforce_reuse_cap(
-        result_paths, result_reasons, clips_analysis, plans_by_sent, cuts,
-        max_per_scene=2, max_per_file=2,
-    )
     return result_paths, result_reasons, ranked_by_cut
 
 
