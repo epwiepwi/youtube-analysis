@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>숏폼 자동화 에이전트</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>🎬 숏폼 자동화 에이전트</h1>
+    <div id="status" class="status">상태 확인 중…</div>
+    <a class="ghost" href="/analysis" target="_blank">📊 공식 분석 리포트</a>
+  </header>
+
+  <main>
+    <!-- 1. 대본 -->
+    <section class="step" id="step-script">
+      <div class="step-head"><span class="num">1</span><h2>대본</h2></div>
+      <p class="hint">기존 인스타 스크립트 도우미를 병합한 단계. 벤치 영상 자막/아이디어를 붙여넣고 공감형 대본을 만들거나, 완성된 대본을 바로 붙여넣어도 됩니다.</p>
+      <label>벤치 대본 / 아이디어 (붙여넣기)</label>
+      <textarea id="src" rows="5" placeholder="벤치 영상 자막이나 떠오른 아이디어…"></textarea>
+      <div class="row">
+        <input id="product" placeholder="소개할 제품/주제 (선택)" />
+        <input id="extra" placeholder="추가 요청 (선택)" />
+      </div>
+      <div class="btns">
+        <button id="gen-script">✨ 공감형 대본 생성</button>
+        <button class="ghost" id="use-as-is">완성 대본으로 바로 사용 ↓</button>
+      </div>
+      <label>최종 대본 (수정 가능 · TTS로 읽힘)</label>
+      <textarea id="script" rows="8" placeholder="여기 대본이 채워집니다…"></textarea>
+    </section>
+
+    <!-- 2. TTS -->
+    <section class="step" id="step-tts">
+      <div class="step-head"><span class="num">2</span><h2>TTS (ElevenLabs)</h2></div>
+      <label class="check"><input type="checkbox" id="use-intro" checked /> 앞에 '버리는 멘트' 넣어서 초반 구린 음성 제거</label>
+      <div class="btns"><button id="gen-tts">🔊 음성 생성</button></div>
+      <audio id="audio" controls hidden></audio>
+      <div id="tts-info" class="info"></div>
+    </section>
+
+    <!-- 3. 자막 -->
+    <section class="step" id="step-srt">
+      <div class="step-head"><span class="num">3</span><h2>자막 (오타 수정)</h2></div>
+      <p class="hint">TTS 타이밍으로 자동 분할된 자막입니다. 오타만 고치세요. 타이밍은 유지됩니다.</p>
+      <div id="segments" class="segments"></div>
+    </section>
+
+    <!-- 4. 캡컷 -->
+    <section class="step" id="step-export">
+      <div class="step-head"><span class="num">4</span><h2>캡컷 내보내기</h2></div>
+      <div class="btns"><button id="export">📦 SRT + 캡컷 드래프트 생성</button></div>
+      <div id="export-result" class="info"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

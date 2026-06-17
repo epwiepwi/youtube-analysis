@@ -1,0 +1,6 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+requests==2.32.3
+python-dotenv==1.0.1
+# 캡컷 드래프트 생성 (선택). 설치 안 돼도 SRT/MP3는 정상 산출됨.
+pyJianYingDraft==0.2.6
