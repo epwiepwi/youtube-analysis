@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.local
+output/
+build/
+dist/
+vendor/ffmpeg/
+*.wav
+*.mp3
+*.mp4
+*.mov
+!profiles/*.json
